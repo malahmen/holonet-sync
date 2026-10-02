@@ -83,6 +83,7 @@ PROTECTED_BRANCHES="main master"
 EXCLUDE_BRANCHES=""
 MAX_DELETIONS=5
 AUTO_MERGE=1
+AUTO_MERGE_PROTECTED=0
 MERGE_AUTHOR_NAME="holonet-sync"
 MERGE_AUTHOR_EMAIL="holonet-sync@localhost"
 ALERT_CMD=""
@@ -453,6 +454,14 @@ do_merge() {
         alert "$tag" "[${CUR_REPO}] branch '${b}' diverged (gitea ${gt:0:10}, github ${gh:0:10}); AUTO_MERGE=0, resolve manually"
         return 1
     fi
+    # A textually clean merge is not a reviewed one: on the branches that
+    # matter most (main, release lines) the merge is left to a human unless
+    # explicitly allowed.
+    if is_protected "$b" && (( ! AUTO_MERGE_PROTECTED )); then
+        CONFLICTS=$((CONFLICTS + 1))
+        alert "$tag" "[${CUR_REPO}] protected branch '${b}' diverged (gitea ${gt:0:10}, github ${gh:0:10}); AUTO_MERGE_PROTECTED=0, resolve manually"
+        return 1
+    fi
 
     # In-memory merge in the bare repo: exit 0 = clean, 1 = conflicts, other = error.
     if out=$(git -C "$WS" merge-tree --write-tree --no-messages "$gt" "$gh" 2>&1); then
@@ -788,6 +797,7 @@ PROTECTED_BRANCHES="main master"        # never deleted by sync; restored if the
 EXCLUDE_BRANCHES="wip/* local/*"        # globs, never synced in either direction
 MAX_DELETIONS=5                         # per repo per run, above this the repo is skipped
 AUTO_MERGE=1                            # 1 = merge clean divergences, 0 = alert only
+AUTO_MERGE_PROTECTED=0                  # same, for PROTECTED_BRANCHES (default: alert only)
 MERGE_AUTHOR_NAME="holonet-sync"
 MERGE_AUTHOR_EMAIL="holonet-sync@localhost"
 

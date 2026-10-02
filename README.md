@@ -25,7 +25,7 @@ is built to live in a cron job or a systemd timer.
 | Branch deleted on one side, untouched on the other | Deletes it on the surviving side |
 | Branch deleted on one side but with new commits on the other | Restores it and alerts — deletion never wins by default |
 | Protected branch (`main`, `master`) vanished | Restores it and alerts |
-| Branches diverged, merge is clean | Auto-merges and pushes the merge to both sides |
+| Branches diverged, merge is clean | Auto-merges and pushes the merge to both sides (on a protected branch only with `AUTO_MERGE_PROTECTED=1`; otherwise alerts) |
 | Branches diverged with conflicts | Leaves both alone and alerts |
 | Tag missing on one side | Copies it |
 | Tag differs between sides | Leaves both alone and alerts |
@@ -142,6 +142,7 @@ commented example. `$HOLONET_SYNC_CONFIG` or `--config` points elsewhere.
 | `EXCLUDE_BRANCHES` | Globs never synced in either direction |
 | `MAX_DELETIONS` | Deletion cap per repo per run |
 | `AUTO_MERGE` | `1` merges clean divergences, `0` only alerts |
+| `AUTO_MERGE_PROTECTED` | Same, for `PROTECTED_BRANCHES`. Default `0`: a clean merge is not a reviewed one, so divergence on `main`/`master` alerts |
 | `MERGE_AUTHOR_NAME`, `MERGE_AUTHOR_EMAIL` | Identity on auto-merge commits |
 | `ALERT_CMD` | Command receiving the alert text on stdin |
 
