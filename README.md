@@ -47,6 +47,10 @@ from the other side).
   override with `--allow-deletions`.
 - **Deletion cap.** More than `MAX_DELETIONS` (default 5) branch deletions
   planned in one run skips that repo entirely.
+- **Git LFS repos are skipped.** Pushes carry only the pointer files; the LFS
+  objects stay on each server's LFS store, so the twin would end up with
+  dangling pointers. A repo whose `.gitattributes` uses `filter=lfs` on any
+  branch is skipped and alerted unless `ALLOW_LFS=1`.
 - **A failed fetch aborts that repo.** An unreachable side is never mistaken for
   an empty one.
 - **Per-ref failure isolation.** A ref whose push fails skips its own remaining
@@ -144,6 +148,7 @@ commented example. `$HOLONET_SYNC_CONFIG` or `--config` points elsewhere.
 | `AUTO_MERGE` | `1` merges clean divergences, `0` only alerts |
 | `MERGE_AUTHOR_NAME`, `MERGE_AUTHOR_EMAIL` | Identity on auto-merge commits |
 | `ALERT_CMD` | Command receiving the alert text on stdin |
+| `ALLOW_LFS` | `1` syncs Git LFS repos anyway (refs and pointer files only); `0` (default) skips them with an alert |
 
 `~/.config/holonet-sync/repos.list` — one pair per line:
 

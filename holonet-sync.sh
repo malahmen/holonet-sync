@@ -86,6 +86,7 @@ AUTO_MERGE=1
 MERGE_AUTHOR_NAME="holonet-sync"
 MERGE_AUTHOR_EMAIL="holonet-sync@localhost"
 ALERT_CMD=""
+ALLOW_LFS=0
 
 # ---- runtime flags ----------------------------------------------------------
 DRY_RUN=0
@@ -293,6 +294,15 @@ rev()         { git -C "$WS" rev-parse -q --verify "$1" 2>/dev/null || true; }
 is_ancestor() { git -C "$WS" merge-base --is-ancestor "$1" "$2"; }
 count_refs()  { git -C "$WS" for-each-ref --format=x "$1" | wc -l; }
 list_names()  { git -C "$WS" for-each-ref --format='%(refname)' "$1" | sed "s|^$1||"; }
+
+# uses_lfs — true when any fetched branch tip routes paths through Git LFS.
+# One git-grep over every distinct tip, root and nested .gitattributes.
+uses_lfs() {
+    local -a tips
+    mapfile -t tips < <(git -C "$WS" for-each-ref --format='%(objectname)' refs/gh/heads/ refs/gt/heads/ | sort -u)
+    (( ${#tips[@]} )) || return 1
+    git -C "$WS" grep -q -e 'filter=lfs' "${tips[@]}" -- '.gitattributes' '*/.gitattributes' 2>/dev/null
+}
 
 # Symbolic HEAD of a remote, empty when unknown.
 remote_default() {
@@ -530,6 +540,16 @@ sync_repo() {
         alert "${KEY}|emptyside|${n_gh}|${n_gt}" \
             "[${CUR_REPO}] one side has no branches but sync state exists (github=${n_gh}, gitea=${n_gt}); refusing. Use 'reset --repo ${gt_full}' or --allow-deletions"
         record_status ERROR "empty-side guard"
+        return 1
+    fi
+
+    # Guard: Git LFS. git push carries only the pointer files; the LFS objects
+    # live on each server's LFS store and would never reach the twin, leaving
+    # it with dangling pointers. Refuse unless explicitly accepted.
+    if uses_lfs && (( ! ALLOW_LFS )); then
+        alert "${KEY}|lfs" \
+            "[${CUR_REPO}] repo uses Git LFS; holonet-sync syncs refs only, so LFS objects would not reach the other side. Skipping (set ALLOW_LFS=1 to sync the pointers anyway)"
+        record_status ERROR "uses Git LFS"
         return 1
     fi
 
@@ -795,6 +815,8 @@ MERGE_AUTHOR_EMAIL="holonet-sync@localhost"
 # ALERT_CMD='curl -fsS -H "Title: holonet-sync" -d @- https://ntfy.lan/holonet-sync'
 # ALERT_CMD='logger -t holonet-sync'
 ALERT_CMD=""
+
+ALLOW_LFS=0                             # 1 = sync Git LFS repos anyway (pointers only)
 EOF
         success "wrote ${CONFIG_FILE}"
     fi
