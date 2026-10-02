@@ -74,6 +74,11 @@ from the other side).
 - **git ≥ 2.38** — `merge-tree --write-tree` is how a clean divergence is merged
   entirely inside the bare workspace, with no working tree. `check` verifies it.
 - **curl**, **jq**, **flock**, **base64**, **sha1sum**
+- **macOS:** the system bash is 3.2 and there is no `flock`; install both
+  (`brew install bash flock`). `sha1sum` ships with recent macOS, or comes from
+  `brew install coreutils`.
+- **https** for `GITEA_URL`: tokens travel in request headers, so a plain
+  `http://` URL sends them unencrypted. `check` warns about it.
 
 ## Install
 
