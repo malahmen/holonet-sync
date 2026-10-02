@@ -94,6 +94,7 @@ NO_API=0
 ALLOW_DELETIONS=0
 ONLY_REPO=""
 TMP=""
+EACH_RC=0
 
 # ---- per-repo working state (set in sync_repo, lives in a subshell) ----------
 KEY="" WS="" CUR_REPO="" PUSHES=0 CONFLICTS=0 DRY_SKIP=0
@@ -290,6 +291,7 @@ ensure_twins() {
 # =============================================================================
 
 rev()         { git -C "$WS" rev-parse -q --verify "$1" 2>/dev/null || true; }
+is_sha()      { [[ "$1" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]; }
 is_ancestor() { git -C "$WS" merge-base --is-ancestor "$1" "$2"; }
 count_refs()  { git -C "$WS" for-each-ref --format=x "$1" | wc -l; }
 list_names()  { git -C "$WS" for-each-ref --format='%(refname)' "$1" | sed "s|^$1||"; }
@@ -398,6 +400,14 @@ plan_tag() {
 # do_push <side> <kind> <name> <sha> <expected-or-empty>
 do_push() {
     local side="$1" kind="$2" name="$3" sha="$4" exp="$5" ref="refs/$2/$3"
+    # An empty source turns `<sha>:<ref>` into `:<ref>`, which is a DELETE that
+    # the lease would happily allow. Only do_delete may remove a ref.
+    # (Inline rather than is_sha: tests source do_push on its own.)
+    if [[ ! "$sha" =~ ^[0-9a-f]{40}([0-9a-f]{24})?$ ]]; then
+        alert "${KEY}|badsha|${side}|${ref}|${sha}" \
+            "[${CUR_REPO}] internal: refusing to push '${sha}' to $(label "$side"):${ref} (not an object id)"
+        return 1
+    fi
     if (( DRY_RUN )); then
         info "[dry-run] push ${sha:0:10} -> $(label "$side"):${ref} (expecting ${exp:0:10}${exp:-absent})"
         return 0
@@ -407,8 +417,9 @@ do_push() {
     # still holds <expect> (empty = must not exist). A concurrent push makes it
     # fail safely instead of being overwritten; the next run picks the change up.
     if git -C "$WS" push --quiet --force-with-lease="${ref}:${exp}" "$side" "${sha}:${ref}" 2>"${TMP}/push.err"; then
-        git -C "$WS" update-ref "refs/${side}/${kind}/${name}" "$sha"
         PUSHES=$((PUSHES + 1))
+        git -C "$WS" update-ref "refs/${side}/${kind}/${name}" "$sha" \
+            || { error "pushed, but could not record refs/${side}/${kind}/${name} locally"; return 1; }
         info "pushed ${sha:0:10} -> $(label "$side"):${ref}"
     else
         alert "${KEY}|pushfail|${side}|${ref}|${sha}" \
@@ -423,8 +434,9 @@ do_delete() {
     if (( DRY_RUN )); then info "[dry-run] delete $(label "$side"):${ref} (expecting ${exp:0:10})"; return 0; fi
 
     if git -C "$WS" push --quiet --force-with-lease="${ref}:${exp}" "$side" ":${ref}" 2>"${TMP}/push.err"; then
-        git -C "$WS" update-ref -d "refs/${side}/${kind}/${name}"
         PUSHES=$((PUSHES + 1))
+        git -C "$WS" update-ref -d "refs/${side}/${kind}/${name}" \
+            || { error "deleted, but could not drop refs/${side}/${kind}/${name} locally"; return 1; }
         info "deleted $(label "$side"):${ref} (deleted on the other side)"
     else
         alert "${KEY}|delfail|${side}|${ref}|${exp}" \
@@ -457,6 +469,11 @@ do_merge() {
     # In-memory merge in the bare repo: exit 0 = clean, 1 = conflicts, other = error.
     if out=$(git -C "$WS" merge-tree --write-tree --no-messages "$gt" "$gh" 2>&1); then
         tree="${out%%$'\n'*}"
+        if ! is_sha "$tree"; then
+            CONFLICTS=$((CONFLICTS + 1))
+            alert "$tag" "[${CUR_REPO}] branch '${b}' diverged; merge-tree returned no tree: ${tree}"
+            return 1
+        fi
     else
         rc=$?
         CONFLICTS=$((CONFLICTS + 1))
@@ -470,10 +487,17 @@ do_merge() {
 
     if (( DRY_RUN )); then info "[dry-run] would auto-merge '${b}' (clean): gitea ${gt:0:10} + github ${gh:0:10}"; return 0; fi
 
-    m=$(GIT_AUTHOR_NAME="$MERGE_AUTHOR_NAME" GIT_AUTHOR_EMAIL="$MERGE_AUTHOR_EMAIL" \
+    # Checked explicitly: do_merge runs from an || context, where errexit is
+    # off, and an empty $m would reach do_push as a delete.
+    if ! m=$(GIT_AUTHOR_NAME="$MERGE_AUTHOR_NAME" GIT_AUTHOR_EMAIL="$MERGE_AUTHOR_EMAIL" \
         GIT_COMMITTER_NAME="$MERGE_AUTHOR_NAME" GIT_COMMITTER_EMAIL="$MERGE_AUTHOR_EMAIL" \
         git -C "$WS" commit-tree "$tree" -p "$gt" -p "$gh" \
-            -m "${SCRIPT_NAME}: merge diverged '${b}' (gitea ${gt:0:10} + github ${gh:0:10})")
+            -m "${SCRIPT_NAME}: merge diverged '${b}' (gitea ${gt:0:10} + github ${gh:0:10})" 2>"${TMP}/merge.err") \
+       || ! is_sha "$m"; then
+        CONFLICTS=$((CONFLICTS + 1))
+        alert "$tag" "[${CUR_REPO}] branch '${b}' diverged cleanly but the merge commit could not be written: $(tr '\n' ' ' < "${TMP}/merge.err")"
+        return 1
+    fi
     info "auto-merged '${b}' -> ${m:0:10}"
 
     # If only one of the two pushes lands, base is not updated; the next run
@@ -591,9 +615,12 @@ sync_repo() {
 
 # for_each_repo <callback>
 # Reads the repo list on fd 3 so nothing inside the loop can consume it.
+# Always returns 0 and leaves the combined callback status in EACH_RC: callers
+# must invoke it bare (never `for_each_repo … || …`), or bash would disable
+# errexit for every callback, including run_one's per-repo subshell.
 # Line format:  <gitea owner/name>  <github owner/name>  [private|public]
 for_each_repo() {
-    local cb="$1" gt_full gh_full vis rest matched=0 rc=0
+    local cb="$1" gt_full gh_full vis rest matched=0 rc=0 cb_rc
     [[ -r "$REPOS_FILE" ]] || error_exit "repo list not found: ${REPOS_FILE}"
 
     while read -r gt_full gh_full vis rest <&3; do
@@ -603,22 +630,27 @@ for_each_repo() {
         if [[ "$vis" != private && "$vis" != public ]]; then warn "bad visibility '${vis}' for ${gt_full}; skipping"; continue; fi
         if [[ -n "$ONLY_REPO" && "$gt_full" != "$ONLY_REPO" ]]; then continue; fi
         matched=$((matched + 1))
-        "$cb" "$gt_full" "$gh_full" "$vis" || rc=1
+        # Not `"$cb" … || rc=1`: bash ignores errexit for everything run from
+        # an ||/&&/if context, including the `( set -e; … )` subshell in
+        # run_one, so the callback must be called bare and its status read
+        # afterwards.
+        set +e
+        "$cb" "$gt_full" "$gh_full" "$vis"
+        cb_rc=$?
+        set -e
+        (( cb_rc == 0 )) || rc=1
     done 3< "$REPOS_FILE"
 
     if [[ -n "$ONLY_REPO" ]] && (( matched == 0 )); then error_exit "${ONLY_REPO} is not in ${REPOS_FILE}"; fi
-    return "$rc"
+    EACH_RC=$rc
 }
 
+# Each repo reconciles in its own subshell, so a failure aborts that repo only.
+# errexit holds inside it only because for_each_repo calls this bare (see
+# there); helpers that sync_repo itself calls from an ||/if context (do_push,
+# do_delete, do_merge, ensure_twins) check their own commands explicitly.
 run_one() {
-    local rc
-    # Own subshell with errexit re-enabled: `set -e` is ignored inside anything
-    # called from an `||`/`if` context, so it can't simply be called with `|| ...`.
-    set +e
     ( set -e; sync_repo "$@" )
-    rc=$?
-    set -e
-    return "$rc"
 }
 
 # =============================================================================
@@ -634,8 +666,8 @@ cmd_run() {
 
     find "${STATE_DIR}/alerts" -type f -mtime +30 -delete 2>/dev/null || true
 
-    local rc=0
-    for_each_repo run_one || rc=1
+    local rc
+    for_each_repo run_one; rc=$EACH_RC
     if (( rc )); then warn "run finished with errors (see above / status)"; else success "run finished"; fi
     return "$rc"
 }
@@ -706,7 +738,7 @@ cmd_check() {
         error "gitea token rejected (HTTP ${code}) $(api_msg)"; ok=0
     fi
 
-    for_each_repo check_repo || ok=0
+    for_each_repo check_repo; (( EACH_RC == 0 )) || ok=0
 
     if (( ok )); then success "check passed"; else error "check failed"; return 1; fi
 }
@@ -757,6 +789,7 @@ _print_repo() { printf '%s\t%s\t%s\n' "$1" "$2" "$3"; }
 cmd_repos() {
     load_config_file
     for_each_repo _print_repo
+    return "$EACH_RC"
 }
 
 cmd_init() {
