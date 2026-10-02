@@ -683,6 +683,16 @@ cmd_check() {
 
     load_config_file; load_tokens; setup_auth
 
+    # Credentials ride on an Authorization header (git) and a token header
+    # (API): over plain http they cross the network readable by anyone on path.
+    local name url
+    for name in GITEA_URL GITHUB_GIT_BASE GITHUB_API; do
+        url="${!name}"
+        if [[ "$url" == http://* ]]; then
+            warn "${name}=${url} is plain http: tokens are sent unencrypted. Use https unless this is a trusted loopback"
+        fi
+    done
+
     code=$(api gh GET /user)
     if [[ "$code" == 200 ]]; then
         login=$(jq -r .login "${TMP}/api.json"); info "github token ok (login: ${login})"
