@@ -85,7 +85,7 @@ echo "## 17. lease: remote moves between fetch and push (simulated via stale exp
 # do_push is lifted straight out of the script and fed hand-set globals, so the
 # linter can neither follow the source nor see where those vars are used.
 # shellcheck disable=SC1090,SC2034
-( source <(sed -n '/^do_push()/,/^}/p' "$SYNC"); WS=$T/state/repos/me__proj.git; TMP=$(mktemp -d); DRY_RUN=0; PUSHES=0; KEY=k; CUR_REPO=me/proj; STATE_DIR=$T/state; ALERT_CMD=""; label(){ echo $1; }; info(){ echo "INFO $*"; }; alert(){ echo "ALERT $2"; }
+( source <(sed -n '/^do_push()/,/^}/p' "$SYNC"); WS=$T/state/repos/me+proj.git; TMP=$(mktemp -d); DRY_RUN=0; PUSHES=0; KEY=k; CUR_REPO=me/proj; STATE_DIR=$T/state; ALERT_CMD=""; label(){ echo $1; }; info(){ echo "INFO $*"; }; alert(){ echo "ALERT $2"; }
   cur=$(git --git-dir=$T/gt/me/proj.git rev-parse main); old=$(git --git-dir=$T/gt/me/proj.git rev-parse main~1)
   do_push gt heads main "$old" "$old" ; echo "   gitea main still $(tip gt main) (expected ${cur:0:7})" )
 check "stale lease rejected, gitea main kept" is gt main "$pre17"
