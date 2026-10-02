@@ -98,6 +98,7 @@ TMP=""
 # ---- per-repo working state (set in sync_repo, lives in a subshell) ----------
 KEY="" WS="" CUR_REPO="" PUSHES=0 CONFLICTS=0 DRY_SKIP=0
 PLAN=()
+DEFER_ALERTS=0 ALERT_QUEUE=()
 
 usage() {
     cat >&2 <<EOF
@@ -134,7 +135,12 @@ EOF
 # alert <dedup-key> <message>
 # Logs always. Runs ALERT_CMD (message on stdin) once per dedup key, so a
 # conflict that stays unresolved does not re-alert on every cron tick.
+#
+# While planning (DEFER_ALERTS=1) alerts are queued instead: a plan-time alert
+# ("restoring it", "tag differs") must not be sent, or stamped as delivered,
+# for a repo that a guard then skips. sync_repo flushes or drops the queue.
 alert() {
+    if (( DEFER_ALERTS )); then ALERT_QUEUE+=("$1" "$2"); return 0; fi
     local key="$1" msg="$2" stamp
     warn "ALERT: ${msg}"
     if [[ -z "$ALERT_CMD" ]] || (( DRY_RUN )); then return 0; fi
@@ -150,6 +156,19 @@ alert() {
     else
         warn "ALERT_CMD failed"
     fi
+}
+
+flush_alerts() {
+    local i
+    DEFER_ALERTS=0
+    for (( i = 0; i < ${#ALERT_QUEUE[@]}; i += 2 )); do alert "${ALERT_QUEUE[i]}" "${ALERT_QUEUE[i+1]}"; done
+    ALERT_QUEUE=()
+}
+
+drop_alerts() {
+    DEFER_ALERTS=0
+    if (( ${#ALERT_QUEUE[@]} )); then dbg "dropped $(( ${#ALERT_QUEUE[@]} / 2 )) planned alert(s): repo skipped"; fi
+    ALERT_QUEUE=()
 }
 
 label() { if [[ "$1" == gh ]]; then echo github; else echo gitea; fi; }
@@ -291,7 +310,7 @@ ensure_twins() {
 
 rev()         { git -C "$WS" rev-parse -q --verify "$1" 2>/dev/null || true; }
 is_ancestor() { git -C "$WS" merge-base --is-ancestor "$1" "$2"; }
-count_refs()  { git -C "$WS" for-each-ref --format=x "$1" | wc -l; }
+count_refs()  { git -C "$WS" for-each-ref --format=x "$1" | wc -l | tr -d ' '; }  # BSD wc pads
 list_names()  { git -C "$WS" for-each-ref --format='%(refname)' "$1" | sed "s|^$1||"; }
 
 # Symbolic HEAD of a remote, empty when unknown.
@@ -500,7 +519,7 @@ sync_repo() {
     CUR_REPO="$gt_full"
     KEY="${gt_full//\//__}"
     WS="${STATE_DIR}/repos/${KEY}.git"
-    PUSHES=0 CONFLICTS=0 DRY_SKIP=0 PLAN=()
+    PUSHES=0 CONFLICTS=0 DRY_SKIP=0 PLAN=() DEFER_ALERTS=0 ALERT_QUEUE=()
     info "== gitea:${gt_full} <-> github:${gh_full}"
 
     if (( ! NO_API )); then
@@ -536,6 +555,7 @@ sync_repo() {
     # Plan branches (default branch first, so a new twin gets the right
     # default), then tags.
     local def b t; local -a branches ordered=()
+    DEFER_ALERTS=1
     def=$(remote_default gt); if [[ -z "$def" ]]; then def=$(remote_default gh); fi
     mapfile -t branches < <( { list_names refs/gh/heads/; list_names refs/gt/heads/; list_names refs/sync/base/heads/; } | sort -u )
     for b in "${branches[@]}"; do if [[ "$b" == "$def" ]]; then ordered+=("$b"); fi; done
@@ -546,6 +566,7 @@ sync_repo() {
     # Nothing to do. Expanding an empty PLAN below would trip `set -u` on
     # bash < 4.4, and a tag conflict adds no plan entry but must still report.
     if (( ${#PLAN[@]} == 0 )); then
+        flush_alerts
         if (( CONFLICTS == 0 )); then dbg "in sync"; fi
         record_status OK
         return 0
@@ -555,11 +576,14 @@ sync_repo() {
     local n_del
     n_del=$(printf '%s\n' "${PLAN[@]}" | grep -c '^del:' || true)
     if (( n_del > MAX_DELETIONS && ! ALLOW_DELETIONS )); then
+        drop_alerts
         alert "${KEY}|maxdel|${n_del}" \
             "[${CUR_REPO}] run would delete ${n_del} branches (MAX_DELETIONS=${MAX_DELETIONS}); refusing. Re-run with --allow-deletions if intended"
         record_status ERROR "deletion guard (${n_del})"
         return 1
     fi
+
+    flush_alerts
 
     # Execute. A failed step on a ref skips that ref's remaining steps,
     # including its base update.
