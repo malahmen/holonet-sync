@@ -483,6 +483,31 @@ do_merge() {
     set_base "$b" "$m"
 }
 
+# repo_key <gitea owner/name> — the per-repo name for the workspace, status
+# file and alert keys. '+' is illegal in Gitea and GitHub owner and repo names,
+# so no two pairs can collide. (The old `${full//\//__}` mapped both a__b/c and
+# a/b__c to a__b__c, so two repos would have shared one workspace and base.)
+repo_key()    { printf '%s+%s' "${1%%/*}" "${1#*/}"; }
+legacy_key()  { printf '%s' "${1//\//__}"; }
+
+# migrate_state <gitea owner/name> — move a workspace named by the old scheme and status file
+# to the new key. Skipped when another listed repo maps to the same legacy key:
+# that state is ambiguous, and re-seeding is safe (it only creates and merges).
+migrate_state() {
+    local full="$1" old new n
+    old=$(legacy_key "$full"); new=$(repo_key "$full")
+    [[ -d "${STATE_DIR}/repos/${old}.git" && ! -e "${STATE_DIR}/repos/${new}.git" ]] || return 0
+
+    n=$(awk '$1 !~ /^#/ && NF >= 2 { k = $1; gsub("/", "__", k); print k }' "$REPOS_FILE" | grep -cxF -- "$old" || true)
+    if (( n > 1 )); then
+        warn "legacy state ${old}.git is shared by ${n} listed repos; not migrating it, ${full} re-seeds"
+        return 0
+    fi
+    mv "${STATE_DIR}/repos/${old}.git" "${STATE_DIR}/repos/${new}.git"
+    if [[ -e "${STATE_DIR}/status/${old}" ]]; then mv "${STATE_DIR}/status/${old}" "${STATE_DIR}/status/${new}"; fi
+    info "migrated state ${old} -> ${new}"
+}
+
 # record_status <RESULT> [detail]
 record_status() {
     if (( DRY_RUN )); then return 0; fi
@@ -498,7 +523,7 @@ record_status() {
 sync_repo() {
     local gt_full="$1" gh_full="$2" vis="$3" side
     CUR_REPO="$gt_full"
-    KEY="${gt_full//\//__}"
+    KEY=$(repo_key "$gt_full")
     WS="${STATE_DIR}/repos/${KEY}.git"
     PUSHES=0 CONFLICTS=0 DRY_SKIP=0 PLAN=()
     info "== gitea:${gt_full} <-> github:${gh_full}"
@@ -508,6 +533,7 @@ sync_repo() {
         if (( DRY_SKIP )); then return 0; fi
     fi
 
+    if (( ! DRY_RUN )); then migrate_state "$gt_full"; fi
     if [[ ! -d "$WS" ]]; then git init -q --bare "$WS"; fi
     git -C "$WS" config remote.gh.url "${GITHUB_GIT_BASE}/${gh_full}.git"
     git -C "$WS" config remote.gt.url "${GITEA_URL}/${gt_full}.git"
@@ -725,7 +751,10 @@ cmd_reset() {
     [[ -n "$ONLY_REPO" ]] || error_exit "reset needs --repo OWNER/NAME"
     load_config_file
 
-    KEY="${ONLY_REPO//\//__}"; WS="${STATE_DIR}/repos/${KEY}.git"
+    KEY=$(repo_key "$ONLY_REPO"); WS="${STATE_DIR}/repos/${KEY}.git"
+    if [[ ! -d "$WS" && -d "${STATE_DIR}/repos/$(legacy_key "$ONLY_REPO").git" ]]; then
+        KEY=$(legacy_key "$ONLY_REPO"); WS="${STATE_DIR}/repos/${KEY}.git"
+    fi
     [[ -d "$WS" ]] || error_exit "no state for ${ONLY_REPO}"
 
     git -C "$WS" for-each-ref --format='delete %(refname)' refs/sync/base/ | git -C "$WS" update-ref --stdin

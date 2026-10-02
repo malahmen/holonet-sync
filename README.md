@@ -183,8 +183,10 @@ through header files, so they never appear in `ps` output or in any repo's
 
 ## State
 
-`~/.local/state/holonet-sync/` holds one bare workspace per repo (the mirrored
-refs plus the `refs/sync/base/*` bookkeeping), the per-repo status lines, and the
+`~/.local/state/holonet-sync/` holds one bare workspace per repo, named
+`repos/<owner>+<name>.git` (the mirrored refs plus the `refs/sync/base/*`
+bookkeeping; workspaces from the older `<owner>__<name>.git` naming are moved
+over automatically), the per-repo status lines, and the
 alert dedup stamps. **Persist it.** Losing it loses no data, but the next run
 re-seeds from scratch — and a re-seeding run can only create and merge, never
 delete.
