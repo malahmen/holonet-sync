@@ -21,6 +21,7 @@ GITHUB_GIT_BASE="file://$T/gh"
 GITEA_USER=me; GITHUB_USER=me
 STATE_DIR="$T/state"
 EXCLUDE_BRANCHES="wip/*"
+AUTO_MERGE_PROTECTED=1   # scenario 6 auto-merges main
 ALERT_CMD='cat >> $T/alerts.log'
 C
 echo "me/proj me/proj private" > $T/cfg/repos.list
