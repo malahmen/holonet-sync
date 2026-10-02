@@ -197,13 +197,18 @@ Mirrors force-push on their own schedule and will fight this tool over every ref
 
 ## Testing
 
-`tests/test-local.sh` runs the whole engine against `file://` bare repos — no
-network, no tokens — covering 19 scenarios including divergence, conflicts,
-deletions, restores, both guards, `reset`, and a stale-lease rejection:
+Everything runs against `file://` bare repos: no network, no tokens.
 
 ```sh
-tests/test-local.sh
+tests/run-all.sh            # every tests/test-*.sh; non-zero exit if any fails
+tests/test-local.sh         # the 19-scenario end-to-end run, each step asserted
 ```
+
+`test-local.sh` covers fast-forwards, new and excluded branches, deletions,
+restores, clean and conflicting divergence, alert dedup, tags, dry-run, both
+guards, `reset`, and a stale-lease rejection. Every scenario is followed by the
+checks it must pass, and the script exits non-zero on the first run that breaks
+one. `HOLONET_SYNC=/path/to/holonet-sync.sh` tests another copy of the engine.
 
 ## Notes
 
