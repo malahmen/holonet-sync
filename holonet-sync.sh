@@ -80,6 +80,7 @@ GITHUB_API="https://api.github.com"
 REPOS_FILE=""
 DEFAULT_VISIBILITY="private"
 PROTECTED_BRANCHES="main master"
+PROPAGATE_REWRITES=0
 EXCLUDE_BRANCHES=""
 MAX_DELETIONS=5
 AUTO_MERGE=1
@@ -346,6 +347,36 @@ plan_one_sided() {
     fi
 }
 
+# Both sides moved since the last sync and at least one of them no longer
+# contains the base: that side was force-pushed (amend, rebase, reset, a
+# history scrub). Merging would bring the dropped commits back on both sides,
+# and a fast-forward to the other side's tip would silently undo a rewind, so
+# a rewrite is never merged. When only one side was rewritten and the other
+# still sits on the base, PROPAGATE_REWRITES=1 carries the rewrite across under
+# a lease on the base; otherwise it alerts and touches neither side.
+plan_rewrite() {
+    local b="$1" gt="$2" gh="$3" base="$4" rewritten="" other new
+    if [[ "$gt" == "$base" ]]; then rewritten=gh other=gt new="$gh"
+    elif [[ "$gh" == "$base" ]]; then rewritten=gt other=gh new="$gt"
+    fi
+
+    if [[ -n "$rewritten" ]] && (( PROPAGATE_REWRITES )); then
+        info "branch '${b}' was rewritten on $(label "$rewritten"); propagating to $(label "$other") (PROPAGATE_REWRITES=1)"
+        add push heads "$other" "$b" "$new" "$base"
+        add base heads - "$b" "$new" ""
+        return 0
+    fi
+
+    CONFLICTS=$((CONFLICTS + 1))
+    if [[ -n "$rewritten" ]]; then
+        alert "${KEY}|rewrite|${b}|${gt}|${gh}" \
+            "[${CUR_REPO}] branch '${b}' was rewritten (force-pushed) on $(label "$rewritten") and is unchanged on the other side; not merging it back and not propagating it (PROPAGATE_REWRITES=0). Resolve manually or set PROPAGATE_REWRITES=1"
+    else
+        alert "${KEY}|rewrite|${b}|${gt}|${gh}" \
+            "[${CUR_REPO}] branch '${b}' was rewritten (force-pushed) and both sides changed since the last sync (gitea ${gt:0:10}, github ${gh:0:10}); resolve manually"
+    fi
+}
+
 plan_branch() {
     local b="$1" gh gt base
     if is_excluded "$b"; then dbg "excluded: ${b}"; return 0; fi
@@ -357,6 +388,8 @@ plan_branch() {
     if [[ -n "$gh" && -n "$gt" ]]; then
         if [[ "$gh" == "$gt" ]]; then
             if [[ "$base" != "$gh" ]]; then add base heads - "$b" "$gh" ""; fi
+        elif [[ -n "$base" ]] && { ! is_ancestor "$base" "$gh" || ! is_ancestor "$base" "$gt"; }; then
+            plan_rewrite "$b" "$gt" "$gh" "$base"
         elif is_ancestor "$gt" "$gh"; then
             add push heads gt "$b" "$gh" "$gt"; add base heads - "$b" "$gh" ""
         elif is_ancestor "$gh" "$gt"; then
@@ -814,6 +847,8 @@ GITHUB_TOKEN_FILE="$HOME/.config/holonet-sync/github.token"
 
 DEFAULT_VISIBILITY="private"            # used when a repos.list line has no 3rd column
 PROTECTED_BRANCHES="main master"        # never deleted by sync; restored if they vanish
+PROPAGATE_REWRITES=0                    # 1 = carry a force-push on one side to the other
+                                        #     (only when the other side is unchanged); 0 = alert
 EXCLUDE_BRANCHES="wip/* local/*"        # globs, never synced in either direction
 MAX_DELETIONS=5                         # per repo per run, above this the repo is skipped
 AUTO_MERGE=1                            # 1 = merge clean divergences, 0 = alert only

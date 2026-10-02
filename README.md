@@ -27,6 +27,8 @@ is built to live in a cron job or a systemd timer.
 | Protected branch (`main`, `master`) vanished | Restores it and alerts |
 | Branches diverged, merge is clean | Auto-merges and pushes the merge to both sides |
 | Branches diverged with conflicts | Leaves both alone and alerts |
+| Branch rewritten (force-pushed) on one side, unchanged on the other | Alerts and leaves both alone; with `PROPAGATE_REWRITES=1`, carries the rewrite across under a lease |
+| Branch rewritten and the other side also moved | Leaves both alone and alerts — a rewrite is never merged back |
 | Tag missing on one side | Copies it |
 | Tag differs between sides | Leaves both alone and alerts |
 
@@ -41,6 +43,12 @@ from the other side).
   picks the change up.
 - **Loop-safe.** A converged pair produces zero pushes, so its own pushes can't
   start a cascade — the next run finds both sides equal.
+- **Rewrites are detected, never merged.** A side that no longer contains the
+  last-synced base was force-pushed (amend, rebase, reset, a history scrub such
+  as mind-trick's). Merging it with the other side would bring the dropped
+  commits back everywhere, so holonet-sync alerts instead, or, with
+  `PROPAGATE_REWRITES=1`, pushes the rewrite to the unchanged side under a lease
+  on the base.
 - **Empty-side guard.** If one side suddenly has no branches while sync state
   exists, the repo is skipped and alerted: a wiped or recreated repo looks
   exactly like "every branch was deleted at once". Clear with `reset`, or
@@ -139,6 +147,7 @@ commented example. `$HOLONET_SYNC_CONFIG` or `--config` points elsewhere.
 | `REPOS_FILE` | Repo list (default: `repos.list` beside the config) |
 | `DEFAULT_VISIBILITY` | Used when a repo list line has no third column |
 | `PROTECTED_BRANCHES` | Globs never deleted by sync, restored if they vanish |
+| `PROPAGATE_REWRITES` | `1` carries a force-push on one side to the other when the other side is unchanged since the last sync; `0` (default) only alerts |
 | `EXCLUDE_BRANCHES` | Globs never synced in either direction |
 | `MAX_DELETIONS` | Deletion cap per repo per run |
 | `AUTO_MERGE` | `1` merges clean divergences, `0` only alerts |
