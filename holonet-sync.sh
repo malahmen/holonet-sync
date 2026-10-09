@@ -259,6 +259,43 @@ api() {
 
 api_msg() { jq -r '.message // empty' "${TMP}/api.json" 2>/dev/null || true; }
 
+# api_diag <target> <code> — why a request failed, attributed to whoever
+# actually said so.
+#
+# The failure this exists for: Gitea had moved to https while a config still
+# said http, so the server answered 400 with "Client sent an HTTP request to
+# an HTTPS server." api_msg looked for a JSON .message, found none, and check
+# reported "gitea token rejected (HTTP 400)" — which sent the operator to look
+# at a token that was perfectly good.
+#
+# 401 and 403 are the only codes that mean a credential was refused. An empty
+# code means curl never got an answer. Anything else is the far end declining
+# the request, and if its body is not even JSON then it is probably not the
+# API talking at all — which points at the URL rather than the token.
+api_diag() {
+    local target="$1" code="$2" msg body var
+    case "$target" in gh) var=GITHUB_API ;; gt) var=GITEA_URL ;; *) var="the base URL" ;; esac
+    msg="$(api_msg)"
+    case "$code" in
+        401|403)
+            printf 'credential refused (HTTP %s)%s' "$code" "${msg:+ — ${msg}}"
+            ;;
+        ''|000)
+            body="$(tr -d '\r' < "${TMP}/curl.err" 2>/dev/null | grep -v '^$' | tail -1)"
+            printf 'no answer from the API%s — is %s reachable?' "${body:+ (${body})}" "$var"
+            ;;
+        *)
+            if [[ -n "$msg" ]]; then
+                printf 'the API declined it (HTTP %s) — %s' "$code" "$msg"
+            else
+                body="$(head -c 120 "${TMP}/api.json" 2>/dev/null | tr -d '\r\n')"
+                printf 'HTTP %s and the body was not JSON%s — check %s (scheme, host, port)' \
+                    "$code" "${body:+: \"${body}\"}" "$var"
+            fi
+            ;;
+    esac
+}
+
 # =============================================================================
 # twin repo lookup / creation
 # =============================================================================
@@ -273,7 +310,7 @@ create_gh() {
     if [[ "${owner,,}" == "${GITHUB_USER,,}" ]]; then path="/user/repos"; else path="/orgs/${owner}/repos"; fi
 
     code=$(api gh POST "$path" "$body")
-    if [[ "$code" != 201 ]]; then error "creating github:${full} failed (HTTP ${code}) $(api_msg)"; return 1; fi
+    if [[ "$code" != 201 ]]; then error "creating github:${full} failed: $(api_diag gh "$code")"; return 1; fi
     info "created github:${full} (${vis})"
 }
 
@@ -288,7 +325,7 @@ create_gt() {
     if [[ "${owner,,}" == "${GITEA_USER,,}" ]]; then path="/user/repos"; else path="/orgs/${owner}/repos"; fi
 
     code=$(api gt POST "$path" "$body")
-    if [[ "$code" != 201 ]]; then error "creating gitea:${full} failed (HTTP ${code}) $(api_msg)"; return 1; fi
+    if [[ "$code" != 201 ]]; then error "creating gitea:${full} failed: $(api_diag gt "$code")"; return 1; fi
     info "created gitea:${full} (${vis})"
 }
 
@@ -792,7 +829,7 @@ check_repo() {
     case "$code" in
         200) info "gitea:${gt_full} ok" ;;
         404) warn "gitea:${gt_full} missing (run will create it)" ;;
-        *)   error "gitea:${gt_full} HTTP ${code}"; return 1 ;;
+        *)   error "gitea:${gt_full}: $(api_diag gt "$code")"; return 1 ;;
     esac
 
     # Gitea push mirrors force-push on their own schedule and would fight this
@@ -803,7 +840,7 @@ check_repo() {
             n=$(jq 'length' "${TMP}/api.json")
             if (( n > 0 )); then error "gitea:${gt_full} has ${n} push mirror(s): remove them, they force-push and will fight ${SCRIPT_NAME}"; return 1; fi
         else
-            warn "gitea:${gt_full} could not list push mirrors (HTTP ${code}); check Settings > Repository > Mirror manually"
+            warn "gitea:${gt_full} could not list push mirrors: $(api_diag gt "$code"); check Settings > Repository > Mirror manually"
         fi
     fi
 
@@ -811,7 +848,7 @@ check_repo() {
     case "$code" in
         200) info "github:${gh_full} ok" ;;
         404) warn "github:${gh_full} missing or not visible to token (run will try to create it)" ;;
-        *)   error "github:${gh_full} HTTP ${code}"; return 1 ;;
+        *)   error "github:${gh_full}: $(api_diag gh "$code")"; return 1 ;;
     esac
 }
 
@@ -849,7 +886,7 @@ cmd_check() {
             info "fine-grained token (no scope header): verify Contents, Workflows and Administration permissions"
         fi
     else
-        error "github token rejected (HTTP ${code}) $(api_msg)"; ok=0
+        error "github /user failed: $(api_diag gh "$code")"; ok=0
     fi
 
     code=$(api gt GET /user)
@@ -857,7 +894,7 @@ cmd_check() {
         login=$(jq -r .login "${TMP}/api.json"); info "gitea token ok (login: ${login})"
         [[ "${login,,}" == "${GITEA_USER,,}" ]] || warn "GITEA_USER=${GITEA_USER} but token belongs to ${login}"
     else
-        error "gitea token rejected (HTTP ${code}) $(api_msg)"; ok=0
+        error "gitea /user failed: $(api_diag gt "$code")"; ok=0
     fi
 
     for_each_repo check_repo; (( EACH_RC == 0 )) || ok=0
