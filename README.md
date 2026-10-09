@@ -284,4 +284,4 @@ could not be checked anywhere, least of all on a runner.
 
 ## License
 
-Released under the [Unlicense](LICENSE).
+[MIT](LICENSE) © 2026 malahmen.
