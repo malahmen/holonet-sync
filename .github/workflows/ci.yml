@@ -1,0 +1,34 @@
+name: ci
+
+# Every push and pull request. The suites need no network, no tokens and no
+# services: they work in temporary directories against file:// remotes and
+# stubbed clients, which is what makes them safe to run here.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Versions
+        # Printed because a suite that behaves differently on the runner than
+        # on a workstation is the thing hardest to debug from a log alone.
+        run: |
+          bash --version | head -1
+          git --version
+          shellcheck --version | sed -n 2p
+
+      - name: shellcheck
+        run: |
+          shellcheck -S warning holonet-sync.sh tests/run-all.sh tests/test-alerts.sh tests/test-api-diagnosis.sh tests/test-lfs.sh tests/test-local.sh tests/test-merge-failure.sh tests/test-protected-merge.sh tests/test-rewrites.sh tests/test-workspace-key.sh 
+
+      - name: tests
+        run: tests/run-all.sh
