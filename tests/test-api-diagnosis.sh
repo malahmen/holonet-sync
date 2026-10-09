@@ -10,6 +10,11 @@
 # authentication problem.
 #
 # Usage: tests/test-api-diagnosis.sh   (no network, no tokens)
+# shellcheck disable=SC2034
+# TMP, GITEA_URL and GITHUB_API are set for the functions eval'd out of the
+# engine below; shellcheck cannot see that use from here. A directive covers
+# only the next COMMAND, and those are three assignments on one line, so this
+# is file-scoped rather than placed above them.
 set -uo pipefail
 
 TEST_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,8 +33,7 @@ diag() {
     printf '%s' "$body" > "$T/api.json"
     printf '%s' "$err"  > "$T/curl.err"
     (
-        TMP="$T"
-        GITEA_URL="https://gitea.example:3000"; GITHUB_API="https://api.github.com"
+        TMP="$T"; GITEA_URL="https://gitea.example:3000"; GITHUB_API="https://api.github.com"
         # api_msg is a one-liner with no closing brace of its own, so a
         # /^api_msg()/,/^}/ range stays open into api_diag and prints its body
         # twice. Grep the one-liner, range only the block.
