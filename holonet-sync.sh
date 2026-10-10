@@ -113,12 +113,14 @@ USAGE
 
 COMMANDS
   init      write an example config and repo list (never overwrites)
-  check     validate tools, tokens, repo access and Gitea push mirrors
+  check     validate tools, tokens, repo access, Gitea push mirrors and that
+            each side's visibility matches what the list declares
   run       reconcile every repo in the list (or one, with --repo)
   status    show the last recorded result per repo (no network)
   reset     forget sync state for --repo (next run re-seeds; never deletes)
   config    print the resolved config/repos/state paths as key=value (stdout)
-  repos     print the valid repo pairs from the list as TSV (stdout)
+  repos     print the valid repo pairs from the list as TSV (stdout):
+            <gitea> <github> <github-vis> <gitea-vis>
   version   print version
 
 FLAGS
@@ -329,9 +331,14 @@ create_gt() {
     info "created gitea:${full} (${vis})"
 }
 
-# ensure_twins <gitea owner/name> <github owner/name> <visibility>
+# ensure_twins <gitea owner/name> <github owner/name> <github-vis> [gitea-vis]
+#
+# Each side is created with ITS OWN declared visibility. They used to share
+# one: a pair declared github-private / gitea-public would have created the
+# Gitea twin private, which is the opposite of why that asymmetry exists (a
+# public LAN-only Gitea repo is one the build pod clones with no deploy key).
 ensure_twins() {
-    local gt_full="$1" gh_full="$2" vis="$3" gt_code gh_code gh_def=""
+    local gt_full="$1" gh_full="$2" vis="$3" gt_vis="${4:-$3}" gt_code gh_code gh_def=""
     gt_code=$(api gt GET "/repos/${gt_full}")
     gh_code=$(api gh GET "/repos/${gh_full}")
     if [[ "$gh_code" == 200 ]]; then gh_def=$(jq -r '.default_branch // empty' "${TMP}/api.json"); fi
@@ -340,7 +347,7 @@ ensure_twins() {
         200:200) return 0 ;;
         404:404) error "neither gitea:${gt_full} nor github:${gh_full} exists"; return 1 ;;
         200:404) create_gh "$gh_full" "$vis" ;;
-        404:200) create_gt "$gt_full" "$vis" "$gh_def" ;;
+        404:200) create_gt "$gt_full" "$gt_vis" "$gh_def" ;;
         *)       error "API lookup failed (gitea HTTP ${gt_code}, github HTTP ${gh_code})"; return 1 ;;
     esac
 }
@@ -651,9 +658,9 @@ record_status() {
 # per-repo reconcile — always runs inside its own `set -e` subshell (run_one)
 # =============================================================================
 
-# sync_repo <gitea owner/name> <github owner/name> <visibility>
+# sync_repo <gitea owner/name> <github owner/name> <github-vis> [gitea-vis]
 sync_repo() {
-    local gt_full="$1" gh_full="$2" vis="$3" side
+    local gt_full="$1" gh_full="$2" vis="$3" gt_vis="${4:-$3}" side
     CUR_REPO="$gt_full"
     KEY=$(repo_key "$gt_full")
     WS="${STATE_DIR}/repos/${KEY}.git"
@@ -661,7 +668,7 @@ sync_repo() {
     info "== gitea:${gt_full} <-> github:${gh_full}"
 
     if (( ! NO_API )); then
-        if ! ensure_twins "$gt_full" "$gh_full" "$vis"; then record_status ERROR "repo lookup/creation failed"; return 1; fi
+        if ! ensure_twins "$gt_full" "$gh_full" "$vis" "$gt_vis"; then record_status ERROR "repo lookup/creation failed"; return 1; fi
         if (( DRY_SKIP )); then return 0; fi
     fi
 
@@ -767,16 +774,32 @@ sync_repo() {
 # Always returns 0 and leaves the combined callback status in EACH_RC: callers
 # must invoke it bare (never `for_each_repo … || …`), or bash would disable
 # errexit for every callback, including run_one's per-repo subshell.
-# Line format:  <gitea owner/name>  <github owner/name>  [private|public]
+# Line format:
+#   <gitea owner/name>  <github owner/name>  [github-vis]  [gitea-vis]
+#
+# The third column is the GITHUB side. That was already true in practice —
+# `manifests` and `azeroth` say private while being public inside Gitea, which
+# is deliberate: public on a LAN-only Gitea means the build pod clones them
+# anonymously, with no deploy key to provision. It was only ever written down
+# in a comment in kuat, so nothing could check it.
+#
+# The fourth column is the GITEA side, defaulting to the third. Two values
+# rather than one, because a single word cannot describe an asymmetric pair,
+# and `check` can now compare each side against what it is supposed to be
+# instead of the column being read once, at creation, and never again.
 for_each_repo() {
-    local cb="$1" gt_full gh_full vis rest matched=0 rc=0 cb_rc
+    local cb="$1" gt_full gh_full vis gt_vis rest matched=0 rc=0 cb_rc
     [[ -r "$REPOS_FILE" ]] || error_exit "repo list not found: ${REPOS_FILE}"
 
-    while read -r gt_full gh_full vis rest <&3; do
+    while read -r gt_full gh_full vis gt_vis rest <&3; do
         if [[ -z "${gt_full:-}" || "$gt_full" == \#* ]]; then continue; fi
         if [[ "$gt_full" != */* || "${gh_full:-}" != */* ]]; then warn "skipping malformed line: ${gt_full} ${gh_full:-}"; continue; fi
         vis="${vis:-$DEFAULT_VISIBILITY}"
         if [[ "$vis" != private && "$vis" != public ]]; then warn "bad visibility '${vis}' for ${gt_full}; skipping"; continue; fi
+        # Defaults to the GitHub side, so every list written before the fourth
+        # column existed behaves exactly as it did.
+        gt_vis="${gt_vis:-$vis}"
+        if [[ "$gt_vis" != private && "$gt_vis" != public ]]; then warn "bad gitea visibility '${gt_vis}' for ${gt_full}; skipping"; continue; fi
         if [[ -n "$ONLY_REPO" && "$gt_full" != "$ONLY_REPO" ]]; then continue; fi
         matched=$((matched + 1))
         # Not `"$cb" … || rc=1`: bash ignores errexit for everything run from
@@ -784,7 +807,7 @@ for_each_repo() {
         # run_one, so the callback must be called bare and its status read
         # afterwards.
         set +e
-        "$cb" "$gt_full" "$gh_full" "$vis"
+        "$cb" "$gt_full" "$gh_full" "$vis" "$gt_vis"
         cb_rc=$?
         set -e
         (( cb_rc == 0 )) || rc=1
@@ -823,11 +846,45 @@ cmd_run() {
 
 version_ge() { printf '%s\n%s\n' "$2" "$1" | sort -V -C; }
 
+# _vis_word <api `private` field> — the declared spelling of an API answer.
+# "unknown" rather than a guess when the field is absent or not a boolean: a
+# missing field must not read as "public".
+_vis_word() {
+    case "${1:-}" in
+        true)  printf 'private' ;;
+        false) printf 'public'  ;;
+        *)     printf 'unknown' ;;
+    esac
+}
+
+# _vis_report <label> <declared> <actual-private-field> — 0 when they agree.
+#
+# A mismatch is a warning, not an error, and nothing is changed to resolve it.
+# Flipping a repository between private and public on the strength of a text
+# file is not a reconciliation this tool should perform unasked — the fix may
+# be to edit the list rather than the repository, and only a person knows
+# which. Reporting it is the whole gap: the column used to be read once, when
+# a missing twin was created, and never looked at again.
+_vis_report() {
+    local label="$1" declared="$2" field="${3:-}" actual
+    actual=$(_vis_word "$field")
+    if [[ "$actual" == unknown ]]; then
+        warn "${label} visibility unreadable (no boolean 'private' field); declared ${declared}"
+        return 1
+    fi
+    if [[ "$actual" != "$declared" ]]; then
+        warn "${label} is ${actual} but the list declares ${declared}: fix one of them (this tool will not flip a repository on its own)"
+        return 1
+    fi
+    info "${label} ${actual} as declared"
+}
+
 check_repo() {
-    local gt_full="$1" gh_full="$2" code n
+    local gt_full="$1" gh_full="$2" vis="${3:-$DEFAULT_VISIBILITY}" gt_vis="${4:-${3:-$DEFAULT_VISIBILITY}}" code n
     code=$(api gt GET "/repos/${gt_full}")
     case "$code" in
-        200) info "gitea:${gt_full} ok" ;;
+        200) info "gitea:${gt_full} ok"
+             _vis_report "gitea:${gt_full}" "$gt_vis" "$(jq -r '.private' "${TMP}/api.json")" || true ;;
         404) warn "gitea:${gt_full} missing (run will create it)" ;;
         *)   error "gitea:${gt_full}: $(api_diag gt "$code")"; return 1 ;;
     esac
@@ -846,7 +903,8 @@ check_repo() {
 
     code=$(api gh GET "/repos/${gh_full}")
     case "$code" in
-        200) info "github:${gh_full} ok" ;;
+        200) info "github:${gh_full} ok"
+             _vis_report "github:${gh_full}" "$vis" "$(jq -r '.private' "${TMP}/api.json")" || true ;;
         404) warn "github:${gh_full} missing or not visible to token (run will try to create it)" ;;
         *)   error "github:${gh_full}: $(api_diag gh "$code")"; return 1 ;;
     esac
@@ -946,7 +1004,9 @@ cmd_config() {
 
 # The valid repo pairs, one TSV line each, using the same parser a run uses —
 # so a front-end's picker can't disagree with what will actually be synced.
-_print_repo() { printf '%s\t%s\t%s\n' "$1" "$2" "$3"; }
+# Both visibilities, so `repos` shows what check compares against rather than
+# half of it.
+_print_repo() { printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "${4:-$3}"; }
 
 cmd_repos() {
     load_config_file
@@ -1003,9 +1063,16 @@ EOF
         info "exists, not touching: ${dir}/repos.list"
     else
         cat > "${dir}/repos.list" <<'EOF'
-# <gitea owner/name>        <github owner/name>        [private|public]
+# <gitea owner/name>        <github owner/name>        [github-vis] [gitea-vis]
+#
+# Column 3 is the GITHUB side; column 4 the GITEA side, defaulting to column 3.
+# Two columns because a pair can legitimately differ: a LAN-only Gitea repo
+# that is public there is one a build pod clones with no deploy key, while the
+# offsite GitHub copy stays private. `check` compares each side against its own
+# column, so a repository that drifts is reported instead of going unnoticed.
 # you/homelab               you/homelab                private
 # you/lan-locate            you/lan-locate             public
+# you/build-source          you/build-source           private      public
 EOF
         success "wrote ${dir}/repos.list"
     fi

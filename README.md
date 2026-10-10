@@ -125,12 +125,12 @@ Run it on a timer once `check` passes:
 | Command | What it does |
 | --- | --- |
 | `init` | Write an example config and repo list (never overwrites) |
-| `check` | Validate tools, git version, tokens, repo access, Gitea push mirrors |
+| `check` | Validate tools, git version, tokens, repo access, Gitea push mirrors, and each side's visibility against the list |
 | `run` | Reconcile every repo in the list (or one, with `--repo`) |
 | `status` | Last recorded result per repo (no network) |
 | `reset` | Forget sync state for `--repo` (next run re-seeds; deletes nothing) |
 | `config` | Print the resolved config/repos/state paths as `key=value` |
-| `repos` | Print the valid repo pairs from the list as TSV |
+| `repos` | Print the valid repo pairs from the list as TSV: gitea, github, github-vis, gitea-vis |
 | `version` | Print version |
 
 ## Flags
@@ -170,13 +170,33 @@ commented example. `$HOLONET_SYNC_CONFIG` or `--config` points elsewhere.
 `~/.config/holonet-sync/repos.list` — one pair per line:
 
 ```
-# <gitea owner/name>   <github owner/name>   [private|public]
+# <gitea owner/name>   <github owner/name>   [github-vis] [gitea-vis]
 me/homelab             me/homelab            private
 me/lan-locate          me/lan-locate         public
+me/build-source        me/build-source       private      public
 ```
 
+Column 3 is the **GitHub** side; column 4 the **Gitea** side, defaulting to
+column 3 — so every list written before the fourth column existed behaves
+exactly as it did.
+
+Two columns because a pair can legitimately differ, and one word cannot say so.
+A LAN-only Gitea repository that is public *there* is one a build pod clones
+with no deploy key to provision and one fewer secret in a vault, while the
+offsite GitHub copy stays private. That asymmetry was already in use; it just
+lived in a comment somewhere else, where nothing could check it.
+
 A pair whose twin doesn't exist yet is created on the other side (skip that with
-`--no-api`).
+`--no-api`), **each side with its own declared visibility**. They used to share
+one, so a pair declared github-private / gitea-public created the Gitea twin
+private — the opposite of the reason for the asymmetry.
+
+`check` compares what each side actually is against its column and **warns**
+on a mismatch. It does not fix it: the right correction may be to edit the list
+rather than the repository, and only a person knows which. Reporting it is the
+whole gap — the column used to be read once, when a twin was created, and never
+looked at again, so a repository could sit private for weeks with the list
+saying public and nothing noticing.
 
 ### Alerts
 
@@ -247,7 +267,7 @@ tests/run-all.sh            # every tests/test-*.sh; non-zero exit if any fails
 tests/test-local.sh         # the 19-scenario end-to-end run, each step asserted
 ```
 
-**75 checks across 8 files:**
+**102 checks across 9 files:**
 
 | File | Checks | What it covers |
 | --- | ---: | --- |
@@ -259,6 +279,7 @@ tests/test-local.sh         # the 19-scenario end-to-end run, each step asserted
 | `test-alerts.sh` | 6 | an alert raised while *planning* is not sent for a repo the guard then skips, and is sent once the run goes ahead |
 | `test-lfs.sh` | 4 | a repo using LFS on any branch is skipped unless `ALLOW_LFS=1` — a refs-only sync would leave the twin with dangling pointers |
 | `test-protected-merge.sh` | 4 | a clean divergence on a protected branch alerts, and merges only with `AUTO_MERGE_PROTECTED=1` |
+| `test-visibility.sh` | 27 | the declared visibility against what each side is, both columns, and that an unreadable `private` field reads as "unknown" rather than as "public" |
 
 Every scenario is followed by the checks it must pass, and the script exits
 non-zero on the first run that breaks one.
