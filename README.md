@@ -1,5 +1,7 @@
 # holonet-sync
 
+[![ci](https://github.com/malahmen/holonet-sync/actions/workflows/ci.yml/badge.svg)](https://github.com/malahmen/holonet-sync/actions/workflows/ci.yml)
+
 **`holonet-sync.sh` — keep Gitea and GitHub repositories converged, both ways.**
 
 > "Two transmitters, one signal."
@@ -217,6 +219,25 @@ If a Gitea repo has a **push mirror** pointing at its GitHub twin, remove it.
 Mirrors force-push on their own schedule and will fight this tool over every ref.
 `check` treats an existing push mirror as a hard failure for that repo.
 
+## When an API call fails, who gets blamed
+
+A failed call to Gitea or GitHub is reported by **what actually went wrong**,
+not by assuming the credential did:
+
+| What came back | What it is reported as |
+| --- | --- |
+| `401` / `403` | the credential was refused, quoting the API's own message |
+| a body that is not JSON | a transport problem — "check `GITEA_URL` / `GITHUB_API`", quoting what the server said |
+| nothing at all | no answer from the API, with `curl`'s reason |
+| JSON with an error | the API declined it, in the API's own words |
+
+This exists because of one incident. Gitea had moved to `https` while a config
+still said `http`, so the server answered `400` with *"Client sent an HTTP
+request to an HTTPS server."* The old code looked for a JSON `.message`, found
+none, and reported **"gitea token rejected (HTTP 400)"** — sending the operator
+to audit a token that was perfectly good. A transport problem must not read as
+an authentication problem.
+
 ## Testing
 
 Everything runs against `file://` bare repos: no network, no tokens.
@@ -226,11 +247,30 @@ tests/run-all.sh            # every tests/test-*.sh; non-zero exit if any fails
 tests/test-local.sh         # the 19-scenario end-to-end run, each step asserted
 ```
 
-`test-local.sh` covers fast-forwards, new and excluded branches, deletions,
-restores, clean and conflicting divergence, alert dedup, tags, dry-run, both
-guards, `reset`, and a stale-lease rejection. Every scenario is followed by the
-checks it must pass, and the script exits non-zero on the first run that breaks
-one. `HOLONET_SYNC=/path/to/holonet-sync.sh` tests another copy of the engine.
+**75 checks across 8 files:**
+
+| File | Checks | What it covers |
+| --- | ---: | --- |
+| `test-local.sh` | 27 | the 19-scenario end-to-end run: fast-forwards, new and excluded branches, deletions, restores, clean and conflicting divergence, alert dedup, tags, dry-run, both guards, `reset`, a stale-lease rejection |
+| `test-rewrites.sh` | 11 | a branch force-pushed on one side is never merged or fast-forwarded **back** to the commits it dropped |
+| `test-api-diagnosis.sh` | 8 | the table above — including that a non-JSON `400` says nothing about the token |
+| `test-workspace-key.sh` | 8 | `a__b/c` and `a/b__c` get separate workspaces, and state under the old key is migrated — unless two listed repos share it |
+| `test-merge-failure.sh` | 7 | a merge commit that cannot be written leaves **both** sides untouched, rather than turning an empty sha into a branch deletion |
+| `test-alerts.sh` | 6 | an alert raised while *planning* is not sent for a repo the guard then skips, and is sent once the run goes ahead |
+| `test-lfs.sh` | 4 | a repo using LFS on any branch is skipped unless `ALLOW_LFS=1` — a refs-only sync would leave the twin with dangling pointers |
+| `test-protected-merge.sh` | 4 | a clean divergence on a protected branch alerts, and merges only with `AUTO_MERGE_PROTECTED=1` |
+
+Every scenario is followed by the checks it must pass, and the script exits
+non-zero on the first run that breaks one.
+`HOLONET_SYNC=/path/to/holonet-sync.sh` tests another copy of the engine.
+
+### CI
+
+[`.github/workflows/ci.yml`](.github/workflows/ci.yml) runs `shellcheck` and
+the whole suite on every push to `main`, every pull request, and on demand. It
+needs **no tokens and no network** — which is the whole reason the suite is
+built on `file://` remotes: a sync tool whose tests needed two live forges
+could not be checked anywhere, least of all on a runner.
 
 ## Notes
 
@@ -244,4 +284,4 @@ one. `HOLONET_SYNC=/path/to/holonet-sync.sh` tests another copy of the engine.
 
 ## License
 
-Released under the [Unlicense](LICENSE).
+[MIT](LICENSE) © 2026 malahmen.
