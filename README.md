@@ -76,6 +76,7 @@ from the other side).
 - **git ≥ 2.38** — `merge-tree --write-tree` is how a clean divergence is merged
   entirely inside the bare workspace, with no working tree. `check` verifies it.
 - **curl**, **jq**, **flock**, **base64**, **sha1sum**
+- **openssl**, only to sign in as a GitHub App (see "Tokens")
 - **macOS:** the system bash is 3.2 and there is no `flock`; install both
   (`brew install bash flock`). `sha1sum` ships with recent macOS, or comes from
   `brew install coreutils`.
@@ -153,8 +154,9 @@ commented example. `$HOLONET_SYNC_CONFIG` or `--config` points elsewhere.
 | Setting | Meaning |
 | --- | --- |
 | `GITEA_URL`, `GITEA_USER` | Gitea base URL (no trailing slash) and account |
-| `GITHUB_USER` | GitHub account |
+| `GITHUB_USER` | GitHub account: the one the repositories belong to |
 | `GITEA_TOKEN_FILE`, `GITHUB_TOKEN_FILE` | Files holding the tokens; `GITEA_TOKEN` / `GITHUB_TOKEN` in the environment override them (k8s secrets, CI) |
+| `GITHUB_APP_ID`, `GITHUB_APP_INSTALLATION_ID`, `GITHUB_APP_KEY_FILE` | Sign in to GitHub as a GitHub App instead of with a token: its App ID, its installation's ID and its private key (PEM). Set, `GITHUB_TOKEN_FILE` is not used |
 | `REPOS_FILE` | Repo list (default: `repos.list` beside the config) |
 | `DEFAULT_VISIBILITY` | Used when a repo list line has no third column |
 | `PROTECTED_BRANCHES` | Globs never deleted by sync, restored if they vanish |
@@ -219,6 +221,18 @@ alerts once rather than on every tick; the stamps age out after 30 days.
   any push touching `.github/workflows/` is rejected, and `check` warns about it.
   A fine-grained token needs Contents, Workflows and Administration.
 
+**Or a GitHub App**, so the sync has an identity of its own on GitHub. With a
+personal token it pushes as you, so a ruleset cannot stop you pushing to a
+protected `main` without stopping the sync too; an app can be the ruleset's one
+bypass. Register it under your account with **Contents** and **Workflows** set
+to *Read & write*, install it on the synced repositories, and set the three
+`GITHUB_APP_*` settings. Each run signs a JWT with the key (openssl), exchanges
+it for a one-hour installation token, and pushes as `x-access-token`; `check`
+reports the installation's permissions and the repositories it reaches. GitHub
+has no way for an app to create a repository under a personal account, so a
+new pair's GitHub repository is created by hand (and the app installed on it);
+the run says so instead of failing obscurely.
+
 Credentials reach git through `GIT_CONFIG_*` environment variables and curl
 through header files, so they never appear in `ps` output or in any repo's
 `.git/config`.
@@ -267,7 +281,7 @@ tests/run-all.sh            # every tests/test-*.sh; non-zero exit if any fails
 tests/test-local.sh         # the 19-scenario end-to-end run, each step asserted
 ```
 
-**102 checks across 9 files:**
+**116 checks across 10 files:**
 
 | File | Checks | What it covers |
 | --- | ---: | --- |
@@ -279,6 +293,7 @@ tests/test-local.sh         # the 19-scenario end-to-end run, each step asserted
 | `test-alerts.sh` | 6 | an alert raised while *planning* is not sent for a repo the guard then skips, and is sent once the run goes ahead |
 | `test-lfs.sh` | 4 | a repo using LFS on any branch is skipped unless `ALLOW_LFS=1` — a refs-only sync would leave the twin with dangling pointers |
 | `test-protected-merge.sh` | 4 | a clean divergence on a protected branch alerts, and merges only with `AUTO_MERGE_PROTECTED=1` |
+| `test-github-app.sh` | 14 | signing in as a GitHub App: a JWT that verifies with the app's public key, the installation token asked for with it and left nowhere in `TMP`, git as `x-access-token`, and no attempt to create a repository an app cannot |
 | `test-visibility.sh` | 27 | the declared visibility against what each side is, both columns, and that an unreadable `private` field reads as "unknown" rather than as "public" |
 
 Every scenario is followed by the checks it must pass, and the script exits
