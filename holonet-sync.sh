@@ -106,7 +106,7 @@ TMP=""
 EACH_RC=0
 
 # ---- per-repo working state (set in sync_repo, lives in a subshell) ----------
-KEY="" WS="" CUR_REPO="" PUSHES=0 CONFLICTS=0 DRY_SKIP=0
+KEY="" WS="" CUR_REPO="" CUR_GH_VIS="" PUSHES=0 CONFLICTS=0 DRY_SKIP=0
 PLAN=()
 DEFER_ALERTS=0 ALERT_QUEUE=()
 
@@ -508,6 +508,19 @@ plan_rewrite() {
     fi
 }
 
+# alert_github_side <branch> <gitea sha> <github sha> — a protected branch
+# moved on GitHub, on a pair whose GitHub side is private. The commits did not
+# come through Gitea's pull request and its CI, and GitHub Free enforces no
+# ruleset on a private repository, so nothing checked them. They are still
+# carried across (a sync that refused would stop converging); the alert is so
+# that they are looked at before Argo CD or anything else deploys from them.
+alert_github_side() {
+    local b="$1" gt="$2" gh="$3" n
+    n=$(git -C "$WS" rev-list --count "${gt}..${gh}")
+    alert "${KEY}|ghside|${b}|${gh}" \
+        "[${CUR_REPO}] protected branch '${b}' moved on GitHub (${n} commit(s), ${gt:0:10}..${gh:0:10}) and is being carried to Gitea; it skipped Gitea's pull request and CI, and GitHub enforces no ruleset on a private repository. Check those commits"
+}
+
 plan_branch() {
     local b="$1" gh gt base
     if is_excluded "$b"; then dbg "excluded: ${b}"; return 0; fi
@@ -522,6 +535,7 @@ plan_branch() {
         elif [[ -n "$base" ]] && { ! is_ancestor "$base" "$gh" || ! is_ancestor "$base" "$gt"; }; then
             plan_rewrite "$b" "$gt" "$gh" "$base"
         elif is_ancestor "$gt" "$gh"; then
+            if is_protected "$b" && [[ "$CUR_GH_VIS" == private ]]; then alert_github_side "$b" "$gt" "$gh"; fi
             add push heads gt "$b" "$gh" "$gt"; add base heads - "$b" "$gh" ""
         elif is_ancestor "$gh" "$gt"; then
             add push heads gh "$b" "$gt" "$gh"; add base heads - "$b" "$gt" ""
@@ -716,7 +730,7 @@ record_status() {
 # sync_repo <gitea owner/name> <github owner/name> <github-vis> [gitea-vis]
 sync_repo() {
     local gt_full="$1" gh_full="$2" vis="$3" gt_vis="${4:-$3}" side
-    CUR_REPO="$gt_full"
+    CUR_REPO="$gt_full" CUR_GH_VIS="$vis"
     KEY=$(repo_key "$gt_full")
     WS="${STATE_DIR}/repos/${KEY}.git"
     PUSHES=0 CONFLICTS=0 DRY_SKIP=0 PLAN=() DEFER_ALERTS=0 ALERT_QUEUE=()
