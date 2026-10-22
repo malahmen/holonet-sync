@@ -213,6 +213,15 @@ ALERT_CMD='curl -fsS -H "Title: holonet-sync" -d @- https://ntfy.example/holonet
 Alerts are **deduplicated** by a hash of the situation, so an unresolved conflict
 alerts once rather than on every tick; the stamps age out after 30 days.
 
+**A protected branch that moves on a private GitHub side alerts.** When
+`main` advances on GitHub and the sync fast-forwards Gitea to it, those
+commits skipped Gitea's pull request and its CI. On a public repository a
+GitHub ruleset can require the same; on a private one GitHub Free enforces no
+ruleset, so nothing checked them. They are still carried across — a sync that
+refused would stop converging — and the alert names the range so it is looked
+at before anything deploys from it. Changes made on Gitea, unprotected
+branches and public GitHub sides do not alert.
+
 ## Tokens
 
 - **Gitea:** `write:repository`, `read:user` (plus `write:organization` to create
@@ -281,7 +290,7 @@ tests/run-all.sh            # every tests/test-*.sh; non-zero exit if any fails
 tests/test-local.sh         # the 19-scenario end-to-end run, each step asserted
 ```
 
-**116 checks across 10 files:**
+**125 checks across 11 files:**
 
 | File | Checks | What it covers |
 | --- | ---: | --- |
@@ -293,6 +302,7 @@ tests/test-local.sh         # the 19-scenario end-to-end run, each step asserted
 | `test-alerts.sh` | 6 | an alert raised while *planning* is not sent for a repo the guard then skips, and is sent once the run goes ahead |
 | `test-lfs.sh` | 4 | a repo using LFS on any branch is skipped unless `ALLOW_LFS=1` — a refs-only sync would leave the twin with dangling pointers |
 | `test-protected-merge.sh` | 4 | a clean divergence on a protected branch alerts, and merges only with `AUTO_MERGE_PROTECTED=1` |
+| `test-github-side.sh` | 9 | a protected branch moving on a private GitHub side alerts once and is still carried; Gitea-side changes, unprotected branches and public GitHub sides stay quiet |
 | `test-github-app.sh` | 14 | signing in as a GitHub App: a JWT that verifies with the app's public key, the installation token asked for with it and left nowhere in `TMP`, git as `x-access-token`, and no attempt to create a repository an app cannot |
 | `test-visibility.sh` | 27 | the declared visibility against what each side is, both columns, and that an unreadable `private` field reads as "unknown" rather than as "public" |
 
