@@ -75,6 +75,12 @@ GITEA_USER=""
 GITEA_TOKEN_FILE=""
 GITHUB_USER=""
 GITHUB_TOKEN_FILE=""
+# A GitHub App instead of a personal token (see "Tokens" in the README): set
+# all three and GITHUB_TOKEN_FILE is not used. GITHUB_USER still names the
+# account the repositories belong to.
+GITHUB_APP_ID=""
+GITHUB_APP_INSTALLATION_ID=""
+GITHUB_APP_KEY_FILE=""
 GITHUB_GIT_BASE="https://github.com"
 GITHUB_API="https://api.github.com"
 REPOS_FILE=""
@@ -219,16 +225,59 @@ read_token() {
     tr -d '[:space:]' < "$f"
 }
 
+app_mode() { [[ -n "$GITHUB_APP_ID" ]]; }
+
+# b64url — base64url without padding, of stdin: a JWT segment.
+b64url() { openssl base64 -A | tr '+/' '-_' | tr -d '='; }
+
+# app_jwt — the JWT a GitHub App authenticates with: RS256, issued a minute
+# back against clock drift, valid 9 minutes (GitHub refuses over 10). openssl
+# reads the key from its file, so it never reaches argv.
+app_jwt() {
+    local now head body sig
+    now=$(date +%s)
+    head=$(printf '{"alg":"RS256","typ":"JWT"}' | b64url)
+    body=$(printf '{"iat":%d,"exp":%d,"iss":"%s"}' $((now - 60)) $((now + 540)) "$GITHUB_APP_ID" | b64url)
+    sig=$(printf '%s.%s' "$head" "$body" | openssl dgst -sha256 -sign "$GITHUB_APP_KEY_FILE" -binary | b64url) || return 1
+    [[ -n "$sig" ]] || return 1
+    printf '%s.%s.%s' "$head" "$body" "$sig"
+}
+
+# app_token — a one-hour installation token for the GitHub App, echoed; a run
+# makes one. Like read_token, callers add `|| exit 1`. What the installation
+# may do is kept in $TMP/app-perms.json for check.
+app_token() {
+    local jwt code
+    [[ -n "$GITHUB_APP_INSTALLATION_ID" ]] || error_exit "GITHUB_APP_INSTALLATION_ID is not set in ${CONFIG_FILE}"
+    [[ -r "$GITHUB_APP_KEY_FILE" ]] || error_exit "GitHub App key not readable: ${GITHUB_APP_KEY_FILE:-GITHUB_APP_KEY_FILE is not set}"
+    command -v openssl >/dev/null 2>&1 || error_exit "a GitHub App needs openssl, to sign its JWT"
+    jwt=$(app_jwt) || error_exit "signing the GitHub App JWT failed: is ${GITHUB_APP_KEY_FILE} the app's private key (PEM)?"
+    printf 'Authorization: Bearer %s\nAccept: application/vnd.github+json\nX-GitHub-Api-Version: 2022-11-28\n' \
+        "$jwt" > "${TMP}/app.h"
+    code=$(curl -sS --max-time 30 -o "${TMP}/api.json" -w '%{http_code}' -X POST -H "@${TMP}/app.h" \
+        "${GITHUB_API}/app/installations/${GITHUB_APP_INSTALLATION_ID}/access_tokens" 2>>"${TMP}/curl.err" || true)
+    rm -f "${TMP}/app.h"
+    [[ "$code" == 201 ]] || error_exit "GitHub App installation token: $(api_diag gh "$code")"
+    jq '.permissions // {}' "${TMP}/api.json" > "${TMP}/app-perms.json"
+    jq -r '.token' "${TMP}/api.json"
+    : > "${TMP}/api.json"
+}
+
 load_tokens() {
-    if [[ -z "${GITHUB_TOKEN:-}" ]]; then GITHUB_TOKEN=$(read_token "$GITHUB_TOKEN_FILE" GITHUB) || exit 1; fi
+    if [[ -z "${GITHUB_TOKEN:-}" ]]; then
+        if app_mode; then GITHUB_TOKEN=$(app_token) || exit 1
+        else GITHUB_TOKEN=$(read_token "$GITHUB_TOKEN_FILE" GITHUB) || exit 1; fi
+    fi
     if [[ -z "${GITEA_TOKEN:-}"  ]]; then GITEA_TOKEN=$(read_token "$GITEA_TOKEN_FILE" GITEA)   || exit 1; fi
 }
 
 # Credentials reach git through GIT_CONFIG_* environment variables: they never
 # appear in argv (ps) nor in any repo's .git/config.
 setup_auth() {
-    local gh_b64 gt_b64
-    gh_b64=$(printf '%s:%s' "$GITHUB_USER" "$GITHUB_TOKEN" | base64 | tr -d '\n')
+    local gh_b64 gt_b64 gh_login="$GITHUB_USER"
+    # An installation token signs in to git as this fixed name.
+    if app_mode; then gh_login="x-access-token"; fi
+    gh_b64=$(printf '%s:%s' "$gh_login" "$GITHUB_TOKEN" | base64 | tr -d '\n')
     gt_b64=$(printf '%s:%s' "$GITEA_USER"  "$GITEA_TOKEN"  | base64 | tr -d '\n')
 
     export GIT_CONFIG_COUNT=2
@@ -307,6 +356,12 @@ create_gh() {
     local full="$1" vis="$2" owner="${1%%/*}" name="${1#*/}" path body code private=true
     [[ "$vis" == public ]] && private=false
     if (( DRY_RUN )); then info "[dry-run] would create github:${full} (${vis})"; DRY_SKIP=1; return 0; fi
+    if app_mode; then
+        # GitHub has no endpoint for an app to create a repository under a
+        # personal account.
+        error "github:${full} does not exist, and a GitHub App cannot create it: create it on GitHub (${vis}, empty), install the app on it, and run again"
+        return 1
+    fi
 
     body=$(jq -nc --arg n "$name" --argjson p "$private" '{name:$n, private:$p, auto_init:false}')
     if [[ "${owner,,}" == "${GITHUB_USER,,}" ]]; then path="/user/repos"; else path="/orgs/${owner}/repos"; fi
@@ -905,7 +960,8 @@ check_repo() {
     case "$code" in
         200) info "github:${gh_full} ok"
              _vis_report "github:${gh_full}" "$vis" "$(jq -r '.private' "${TMP}/api.json")" || true ;;
-        404) warn "github:${gh_full} missing or not visible to token (run will try to create it)" ;;
+        404) if app_mode; then error "github:${gh_full} missing, or the GitHub App is not installed on it (Settings > Integrations > Applications > Configure)"; return 1
+             else warn "github:${gh_full} missing or not visible to token (run will try to create it)"; fi ;;
         *)   error "github:${gh_full}: $(api_diag gh "$code")"; return 1 ;;
     esac
 }
@@ -932,19 +988,23 @@ cmd_check() {
         fi
     done
 
-    code=$(api gh GET /user)
-    if [[ "$code" == 200 ]]; then
-        login=$(jq -r .login "${TMP}/api.json"); info "github token ok (login: ${login})"
-        [[ "${login,,}" == "${GITHUB_USER,,}" ]] || warn "GITHUB_USER=${GITHUB_USER} but token belongs to ${login}"
-        scopes=$(curl -sS -o /dev/null -D - -H "@${TMP}/gh.h" "${GITHUB_API}/user" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-oauth-scopes"{print $2}')
-        if [[ -n "$scopes" ]]; then
-            info "classic token scopes: ${scopes}"
-            [[ "$scopes" == *workflow* ]] || warn "token lacks 'workflow' scope: pushes touching .github/workflows/ will be rejected"
-        else
-            info "fine-grained token (no scope header): verify Contents, Workflows and Administration permissions"
-        fi
+    if app_mode; then
+        app_check || ok=0
     else
-        error "github /user failed: $(api_diag gh "$code")"; ok=0
+        code=$(api gh GET /user)
+        if [[ "$code" == 200 ]]; then
+            login=$(jq -r .login "${TMP}/api.json"); info "github token ok (login: ${login})"
+            [[ "${login,,}" == "${GITHUB_USER,,}" ]] || warn "GITHUB_USER=${GITHUB_USER} but token belongs to ${login}"
+            scopes=$(curl -sS -o /dev/null -D - -H "@${TMP}/gh.h" "${GITHUB_API}/user" | tr -d '\r' | awk -F': ' 'tolower($1)=="x-oauth-scopes"{print $2}')
+            if [[ -n "$scopes" ]]; then
+                info "classic token scopes: ${scopes}"
+                [[ "$scopes" == *workflow* ]] || warn "token lacks 'workflow' scope: pushes touching .github/workflows/ will be rejected"
+            else
+                info "fine-grained token (no scope header): verify Contents, Workflows and Administration permissions"
+            fi
+        else
+            error "github /user failed: $(api_diag gh "$code")"; ok=0
+        fi
     fi
 
     code=$(api gt GET /user)
@@ -958,6 +1018,26 @@ cmd_check() {
     for_each_repo check_repo; (( EACH_RC == 0 )) || ok=0
 
     if (( ok )); then success "check passed"; else error "check failed"; return 1; fi
+}
+
+# app_check — the GitHub App's half of check: what its installation may do
+# and which repositories it reaches. An installation token has no /user.
+app_check() {
+    local perm want code n rc=0
+    info "github: GitHub App ${GITHUB_APP_ID}, installation ${GITHUB_APP_INSTALLATION_ID} (token ok)"
+    for want in contents workflows; do
+        perm=$(jq -r --arg p "$want" '.[$p] // "none"' "${TMP}/app-perms.json")
+        if [[ "$perm" == write ]]; then info "github app ${want}: write"
+        else error "github app ${want}: ${perm}, needs Read & write (app settings > Permissions; then accept the change on the installation)"; rc=1; fi
+    done
+    code=$(api gh GET "/installation/repositories?per_page=100")
+    if [[ "$code" == 200 ]]; then
+        n=$(jq '.total_count' "${TMP}/api.json")
+        info "github app installed on ${n} repositor$( (( n == 1 )) && echo y || echo ies): $(jq -r '[.repositories[].full_name] | join(", ")' "${TMP}/api.json")"
+    else
+        error "github app repositories: $(api_diag gh "$code")"; rc=1
+    fi
+    return "$rc"
 }
 
 cmd_status() {
@@ -1034,6 +1114,11 @@ GITHUB_TOKEN_FILE="$HOME/.config/holonet-sync/github.token"
 # GitHub classic PAT: repo, workflow
 # (without 'workflow', any push that touches .github/workflows/ is rejected)
 # Env vars GITEA_TOKEN / GITHUB_TOKEN override the files (e.g. k8s secrets).
+# Or sign in as a GitHub App (Contents and Workflows: Read & write), so the sync
+# is not you on GitHub; GITHUB_USER then only names the repositories' owner:
+#GITHUB_APP_ID="123456"
+#GITHUB_APP_INSTALLATION_ID="12345678"
+#GITHUB_APP_KEY_FILE="$HOME/.config/holonet-sync/github-app.pem"
 
 # REPOS_FILE="$HOME/.config/holonet-sync/repos.list"
 # STATE_DIR="$HOME/.local/state/holonet-sync"   # bare workspaces + sync base; persist it
