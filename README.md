@@ -142,7 +142,8 @@ Run it on a timer once `check` passes:
 | `--repo OWNER/NAME` | Limit to one Gitea repo from the list |
 | `--dry-run` | Plan and report, push nothing |
 | `--allow-deletions` | Bypass `MAX_DELETIONS` and the empty-side guard for this run |
-| `--no-api` | Skip API lookups and twin creation (both repos must already exist) |
+| `--no-create` | Look both repositories up, and refuse to push into a side declared private that is not, but never create one. What a timer should run when its tokens may not create repositories |
+| `--no-api` | No API calls at all: no lookup, no creation and **no visibility gate** (offline tests; both repos must already exist) |
 | `-v`, `--verbose` | Debug logging |
 | `-h`, `--help` | Show help |
 
@@ -180,7 +181,8 @@ me/build-source        me/build-source       private      public
 
 Column 3 is the **GitHub** side; column 4 the **Gitea** side, defaulting to
 column 3 — so every list written before the fourth column existed behaves
-exactly as it did.
+exactly as it did. `#` starts a comment anywhere on a line, after the columns
+too.
 
 Two columns because a pair can legitimately differ, and one word cannot say so.
 A LAN-only Gitea repository that is public *there* is one a build pod clones
@@ -189,13 +191,22 @@ offsite GitHub copy stays private. That asymmetry was already in use; it just
 lived in a comment somewhere else, where nothing could check it.
 
 A pair whose twin doesn't exist yet is created on the other side (skip that with
-`--no-api`), **each side with its own declared visibility**. They used to share
+`--no-create`), **each side with its own declared visibility**, and read back
+from the answer: an organisation's policy can override the visibility asked
+for. They used to share
 one, so a pair declared github-private / gitea-public created the Gitea twin
 private — the opposite of the reason for the asymmetry.
 
-`check` compares what each side actually is against its column and **warns**
-on a mismatch. It does not fix it: the right correction may be to edit the list
-rather than the repository, and only a person knows which. Reporting it is the
+**Nothing declared private is pushed somewhere public.** Before syncing a pair,
+`run` reads each side's visibility (unless `--no-api`); a side declared private
+that is public, or whose visibility cannot be read, stops the pair: nothing is
+pushed, the status says `ERROR`, and `ALERT_CMD` hears about it once. A side
+declared public that is private exposes nothing and syncs as usual.
+
+`check` compares what each side actually is against its column and **fails**
+on any mismatch, so a deploy that runs it stops there. Neither fixes it: the
+right correction may be to edit the list rather than the repository, and only
+a person knows which. Reporting it is the
 whole gap — the column used to be read once, when a twin was created, and never
 looked at again, so a repository could sit private for weeks with the list
 saying public and nothing noticing.
@@ -304,6 +315,7 @@ tests/test-local.sh         # the 19-scenario end-to-end run, each step asserted
 | `test-protected-merge.sh` | 4 | a clean divergence on a protected branch alerts, and merges only with `AUTO_MERGE_PROTECTED=1` |
 | `test-github-side.sh` | 9 | a protected branch moving on a private GitHub side alerts once and is still carried; Gitea-side changes, unprotected branches and public GitHub sides stay quiet |
 | `test-github-app.sh` | 14 | signing in as a GitHub App: a JWT that verifies with the app's public key, the installation token asked for with it and left nowhere in `TMP`, git as `x-access-token`, and no attempt to create a repository an app cannot |
+| `test-twins.sh` | 25 | the API half of a run, against a stubbed `curl`: a side declared private that is public or unreadable is never pushed to (and alerted once), `--no-create`, a twin created public by policy refused, `check` failing on a mismatch, the protected-branch alert following what GitHub *is*, and trailing comments in the list |
 | `test-visibility.sh` | 27 | the declared visibility against what each side is, both columns, and that an unreadable `private` field reads as "unknown" rather than as "public" |
 
 Every scenario is followed by the checks it must pass, and the script exits

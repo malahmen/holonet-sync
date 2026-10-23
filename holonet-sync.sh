@@ -100,6 +100,7 @@ ALLOW_LFS=0
 DRY_RUN=0
 VERBOSE=0
 NO_API=0
+NO_CREATE=0
 ALLOW_DELETIONS=0
 ONLY_REPO=""
 TMP=""
@@ -134,7 +135,10 @@ FLAGS
   --repo OWNER/NAME    limit to one Gitea repo from the list
   --dry-run            plan and report, push nothing
   --allow-deletions    bypass MAX_DELETIONS and the empty-side guard for this run
-  --no-api             skip API lookups / twin creation (both repos must exist)
+  --no-create          look both repos up (and refuse to push into a side
+                       declared private that is not) but never create one
+  --no-api             no API calls at all: no lookup, no creation, and no
+                       visibility gate (offline tests; both repos must exist)
   -v, --verbose        debug logging
   -h, --help
 
@@ -386,25 +390,71 @@ create_gt() {
     info "created gitea:${full} (${vis})"
 }
 
+# _vis_gate <label> <declared> <api `private` field> — 0 when pushing to that
+# side cannot expose anything.
+#
+# A side declared private must BE private before anything is pushed to it:
+# public, or unreadable, is refused (Kamino item 129). Only `check` used to
+# look, and it exited 0 either way, so a twin made public by hand went on
+# receiving every push. Nothing is flipped: the fix may be the list rather
+# than the repository, and only a person knows which. A side declared public
+# that is private exposes nothing, and is left to `check` to report.
+_vis_gate() {
+    local label="$1" declared="$2" actual
+    actual=$(_vis_word "${3:-}")
+    if [[ "$declared" != private || "$actual" == private ]]; then return 0; fi
+    error "${label} is ${actual} but the list declares it private: nothing is synced until one of them changes"
+    alert "visibility:${label}:${actual}" "[${CUR_REPO}] ${label} is ${actual} but the list declares it private; holonet-sync stopped syncing the pair. Make it private, or declare it public in the list"
+    return 1
+}
+
 # ensure_twins <gitea owner/name> <github owner/name> <github-vis> [gitea-vis]
 #
 # Each side is created with ITS OWN declared visibility. They used to share
 # one: a pair declared github-private / gitea-public would have created the
 # Gitea twin private, which is the opposite of why that asymmetry exists (a
 # public LAN-only Gitea repo is one the build pod clones with no deploy key).
+#
+# Every side that exists is gated on its visibility before anything is
+# created or pushed, and a side just created is read back from the answer:
+# an organisation's policy can override the `private` asked for (Kamino 130).
 ensure_twins() {
-    local gt_full="$1" gh_full="$2" vis="$3" gt_vis="${4:-$3}" gt_code gh_code gh_def=""
+    local gt_full="$1" gh_full="$2" vis="$3" gt_vis="${4:-$3}" gt_code gh_code gh_def="" gt_priv="" gh_priv=""
     gt_code=$(api gt GET "/repos/${gt_full}")
+    if [[ "$gt_code" == 200 ]]; then gt_priv=$(jq -r '.private' "${TMP}/api.json"); fi
     gh_code=$(api gh GET "/repos/${gh_full}")
-    if [[ "$gh_code" == 200 ]]; then gh_def=$(jq -r '.default_branch // empty' "${TMP}/api.json"); fi
+    if [[ "$gh_code" == 200 ]]; then
+        gh_def=$(jq -r '.default_branch // empty' "${TMP}/api.json")
+        gh_priv=$(jq -r '.private' "${TMP}/api.json")
+    fi
 
     case "${gt_code}:${gh_code}" in
-        200:200) return 0 ;;
+        200:200|200:404|404:200) ;;
         404:404) error "neither gitea:${gt_full} nor github:${gh_full} exists"; return 1 ;;
-        200:404) create_gh "$gh_full" "$vis" ;;
-        404:200) create_gt "$gt_full" "$gt_vis" "$gh_def" ;;
         *)       error "API lookup failed (gitea HTTP ${gt_code}, github HTTP ${gh_code})"; return 1 ;;
     esac
+    if [[ "$gt_code" == 200 ]]; then _vis_gate "gitea:${gt_full}" "$gt_vis" "$gt_priv" || return 1; fi
+    if [[ "$gh_code" == 200 ]]; then _vis_gate "github:${gh_full}" "$vis" "$gh_priv" || return 1; fi
+
+    if [[ "${gt_code}:${gh_code}" != 200:200 ]] && (( NO_CREATE )); then
+        if [[ "$gh_code" == 404 ]]; then error "github:${gh_full} does not exist, and --no-create is set: create it (${vis}, empty) and run again"
+        else error "gitea:${gt_full} does not exist, and --no-create is set: create it (${gt_vis}, empty) and run again"; fi
+        return 1
+    fi
+    case "${gt_code}:${gh_code}" in
+        200:404) create_gh "$gh_full" "$vis" || return 1
+                 (( DRY_SKIP )) && return 0
+                 gh_priv=$(jq -r '.private' "${TMP}/api.json")
+                 _vis_gate "github:${gh_full}" "$vis" "$gh_priv" || return 1 ;;
+        404:200) create_gt "$gt_full" "$gt_vis" "$gh_def" || return 1
+                 (( DRY_SKIP )) && return 0
+                 gt_priv=$(jq -r '.private' "${TMP}/api.json")
+                 _vis_gate "gitea:${gt_full}" "$gt_vis" "$gt_priv" || return 1 ;;
+    esac
+
+    # The protected-branch alert asks whether GitHub enforces a ruleset, which
+    # depends on what the repository IS, not on what the list says (Kamino 130).
+    CUR_GH_VIS=$(_vis_word "$gh_priv")
 }
 
 # =============================================================================
@@ -857,11 +907,17 @@ sync_repo() {
 # and `check` can now compare each side against what it is supposed to be
 # instead of the column being read once, at creation, and never again.
 for_each_repo() {
-    local cb="$1" gt_full gh_full vis gt_vis rest matched=0 rc=0 cb_rc
+    local cb="$1" line gt_full gh_full vis gt_vis rest matched=0 rc=0 cb_rc
     [[ -r "$REPOS_FILE" ]] || error_exit "repo list not found: ${REPOS_FILE}"
 
-    while read -r gt_full gh_full vis gt_vis rest <&3; do
-        if [[ -z "${gt_full:-}" || "$gt_full" == \#* ]]; then continue; fi
+    while IFS= read -r line <&3 || [[ -n "$line" ]]; do
+        # A trailing comment is dropped before the columns are split: with the
+        # fourth column, `a/b a/b private  # offsite` read '#' as the Gitea
+        # visibility and the pair stopped syncing (Kamino item 130). A '#' can
+        # never be part of an owner/name.
+        line="${line%%#*}"
+        read -r gt_full gh_full vis gt_vis rest <<< "$line"
+        if [[ -z "${gt_full:-}" ]]; then continue; fi
         if [[ "$gt_full" != */* || "${gh_full:-}" != */* ]]; then warn "skipping malformed line: ${gt_full} ${gh_full:-}"; continue; fi
         vis="${vis:-$DEFAULT_VISIBILITY}"
         if [[ "$vis" != private && "$vis" != public ]]; then warn "bad visibility '${vis}' for ${gt_full}; skipping"; continue; fi
@@ -928,7 +984,8 @@ _vis_word() {
 
 # _vis_report <label> <declared> <actual-private-field> — 0 when they agree.
 #
-# A mismatch is a warning, not an error, and nothing is changed to resolve it.
+# A mismatch fails `check` (and, for a side declared private, `run` refuses to
+# push to it: see _vis_gate), but nothing is changed to resolve it.
 # Flipping a repository between private and public on the strength of a text
 # file is not a reconciliation this tool should perform unasked — the fix may
 # be to edit the list rather than the repository, and only a person knows
@@ -948,12 +1005,14 @@ _vis_report() {
     info "${label} ${actual} as declared"
 }
 
+# A visibility mismatch fails check (Kamino item 129): it is what a deploy or
+# a monitor gates on, and a warning followed by exit 0 gated nothing.
 check_repo() {
-    local gt_full="$1" gh_full="$2" vis="${3:-$DEFAULT_VISIBILITY}" gt_vis="${4:-${3:-$DEFAULT_VISIBILITY}}" code n
+    local gt_full="$1" gh_full="$2" vis="${3:-$DEFAULT_VISIBILITY}" gt_vis="${4:-${3:-$DEFAULT_VISIBILITY}}" code n rc=0
     code=$(api gt GET "/repos/${gt_full}")
     case "$code" in
         200) info "gitea:${gt_full} ok"
-             _vis_report "gitea:${gt_full}" "$gt_vis" "$(jq -r '.private' "${TMP}/api.json")" || true ;;
+             _vis_report "gitea:${gt_full}" "$gt_vis" "$(jq -r '.private' "${TMP}/api.json")" || rc=1 ;;
         404) warn "gitea:${gt_full} missing (run will create it)" ;;
         *)   error "gitea:${gt_full}: $(api_diag gt "$code")"; return 1 ;;
     esac
@@ -973,11 +1032,12 @@ check_repo() {
     code=$(api gh GET "/repos/${gh_full}")
     case "$code" in
         200) info "github:${gh_full} ok"
-             _vis_report "github:${gh_full}" "$vis" "$(jq -r '.private' "${TMP}/api.json")" || true ;;
+             _vis_report "github:${gh_full}" "$vis" "$(jq -r '.private' "${TMP}/api.json")" || rc=1 ;;
         404) if app_mode; then error "github:${gh_full} missing, or the GitHub App is not installed on it (Settings > Integrations > Applications > Configure)"; return 1
              else warn "github:${gh_full} missing or not visible to token (run will try to create it)"; fi ;;
         *)   error "github:${gh_full}: $(api_diag gh "$code")"; return 1 ;;
     esac
+    return "$rc"
 }
 
 cmd_check() {
@@ -1188,6 +1248,7 @@ main() {
             --dry-run)         DRY_RUN=1; shift ;;
             --allow-deletions) ALLOW_DELETIONS=1; shift ;;
             --no-api)          NO_API=1; shift ;;
+            --no-create)       NO_CREATE=1; shift ;;
             -v|--verbose)      VERBOSE=1; shift ;;
             -h|--help)         usage; exit 0 ;;
             *)                 usage; error_exit "unknown flag: $1" ;;

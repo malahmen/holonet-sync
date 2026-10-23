@@ -28,7 +28,7 @@ jobs:
 
       - name: shellcheck
         run: |
-          shellcheck -S warning holonet-sync.sh tests/run-all.sh tests/test-alerts.sh tests/test-api-diagnosis.sh tests/test-github-app.sh tests/test-github-side.sh tests/test-lfs.sh tests/test-local.sh tests/test-merge-failure.sh tests/test-protected-merge.sh tests/test-rewrites.sh tests/test-workspace-key.sh 
+          shellcheck -S warning holonet-sync.sh tests/run-all.sh tests/test-alerts.sh tests/test-api-diagnosis.sh tests/test-github-app.sh tests/test-github-side.sh tests/test-lfs.sh tests/test-local.sh tests/test-merge-failure.sh tests/test-protected-merge.sh tests/test-rewrites.sh tests/test-workspace-key.sh tests/test-twins.sh 
 
       - name: tests
         run: tests/run-all.sh
