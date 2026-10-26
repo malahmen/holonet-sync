@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # The API half of a run, which every other end-to-end suite skips with
-# --no-api (Kamino items 129 and 130): ensure_twins' visibility gate,
-# --no-create, a created twin read back, `check` failing on a mismatch, the
-# protected-branch alert keyed on what GitHub IS, and trailing comments in the
-# repo list.
+# --no-api (Kamino items 129, 130, 172 and 195): ensure_twins' visibility
+# gate and its fail-closed lookups, --no-create, a created twin read back on
+# either side, `check` failing on a mismatch, the protected-branch alert keyed
+# on what GitHub IS, trailing comments in the repo list, a broken list line
+# failing the run, and a repository listed in two pairs refused.
 #
 # No network: git remotes are file://, and `curl` is a stub on PATH that
 # answers from $T/api/<gt|gh>/<owner>/<name> (the repository's `private`
@@ -219,6 +220,71 @@ check "a trailing comment does not become the visibility" not grep -q "bad gitea
 GS repos
 check "repos lists the commented pair with its columns"    grep -qx "me/pubdecl$(printf '\t')me/pubdecl$(printf '\t')public$(printf '\t')public" "$T/last.out"
 check "a full-line comment is still skipped"               not said "a full-line"
+
+echo
+echo "== 195: a broken line is an error, not a quiet skip =="
+# The good line must still sync, and run and check must still say the list
+# is broken: a warning followed by exit 0 is what a timer and a deploy gate
+# cannot see.
+pair listok false true
+cat > "$LIST" <<L
+me/listok   me/listok   private public
+malformed-line
+me/typo     me/typo     Private
+L
+GS run
+check "run exits non-zero on a broken list"           test "$RC" -ne 0
+check "  and the good line still syncs"               synced listok
+check "  naming the malformed line"                   said "malformed line"
+check "  and the misspelled visibility"               said "bad visibility 'Private'"
+GS check
+check "check exits non-zero on a broken list"         test "$RC" -ne 0
+check "  and still checks the good line"              said "github:me/listok private as declared"
+GS repos
+check "repos exits non-zero on a broken list"         test "$RC" -ne 0
+check "  and still lists the good line"               grep -q "^me/listok" "$T/last.out"
+
+echo
+echo "== 195: a repository belongs to one pair =="
+# Workspace, base refs and status are keyed on the Gitea repository: two
+# GitHub twins for it would share base refs, and a branch missing on the
+# second would plan as "deleted on GitHub". One GitHub twin for two Gitea
+# repositories would carry each one's branches - and deletions - into the
+# other. Every line naming a shared repository is refused.
+pair dupa   false true     # one Gitea repository, two GitHub twins
+pair dupb   ""    true
+pair dupc   false true     # two Gitea repositories, one GitHub twin
+pair dupd   false true
+pair shared ""    true
+pair dupe   false true     # the same Gitea repository, spelled twice
+pair dupf   ""    true
+cat > "$LIST" <<L
+me/listok   me/listok   private public
+me/dupa     me/dupa     private public
+me/dupa     me/dupb     private public
+me/dupc     me/shared   private public
+me/dupd     me/shared   private public
+me/dupe     me/dupe     private public
+ME/DupE     me/dupf     private public
+L
+: > "$T/api.log"
+GS run
+check "run exits non-zero"                            test "$RC" -ne 0
+check "a Gitea repository listed twice is refused"    said "gitea:me/dupa is listed more than once"
+check "  nothing reaches either GitHub twin"          bash -c '[[ "$1" == - && "$2" == - ]]' _ "$(tip gh dupa)" "$(tip gh dupb)"
+check "  nothing is even looked up"                   not grep -q "/repos/me/dupa" "$T/api.log"
+check "a GitHub repository twinned twice is refused"  said "github:me/shared is the twin of more than one"
+check "  nothing reaches it"                          test "$(tip gh shared)" = -
+check "a duplicate differing only in case is refused" said "gitea:ME/DupE is listed more than once"
+check "  nothing reaches either twin"                 bash -c '[[ "$1" == - && "$2" == - ]]' _ "$(tip gh dupe)" "$(tip gh dupf)"
+check "the pair listed once still runs"               said "gitea:me/listok <-> github:me/listok"
+GS run --repo me/dupa
+check "--repo on a duplicate is refused too"          test "$RC" -ne 0
+check "  and still pushes nothing"                    test "$(tip gh dupa)" = -
+GS check
+check "check exits non-zero on a duplicate"           test "$RC" -ne 0
+GS repos
+check "repos leaves the refused pairs out"            not grep -qi "^me/dup" "$T/last.out"
 
 echo
 (( FAILS == 0 )) && echo "test-twins: all checks passed" || { echo "test-twins: ${FAILS} check(s) failed"; exit 1; }
