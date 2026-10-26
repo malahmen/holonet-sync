@@ -27,8 +27,10 @@ jobs:
           shellcheck --version | sed -n 2p
 
       - name: shellcheck
+        # A glob, not a list: a list named twelve of thirteen files and the
+        # one it missed (test-visibility.sh) went unchecked (Kamino 195).
         run: |
-          shellcheck -S warning holonet-sync.sh tests/run-all.sh tests/test-alerts.sh tests/test-api-diagnosis.sh tests/test-github-app.sh tests/test-github-side.sh tests/test-lfs.sh tests/test-local.sh tests/test-merge-failure.sh tests/test-protected-merge.sh tests/test-rewrites.sh tests/test-workspace-key.sh tests/test-twins.sh 
+          shellcheck -S warning holonet-sync.sh tests/*.sh
 
       - name: tests
         run: tests/run-all.sh

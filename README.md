@@ -184,6 +184,17 @@ column 3 — so every list written before the fourth column existed behaves
 exactly as it did. `#` starts a comment anywhere on a line, after the columns
 too.
 
+A line that cannot be used — fewer than two `owner/name` columns, or a
+visibility other than `private`/`public` (`Private` included) — is reported
+and skipped, and makes `run`, `check` and `repos` exit non-zero; every other
+line is still processed. **A repository belongs to one pair:** every line that
+names a Gitea or GitHub repository another line also names (compared
+case-insensitively) is refused, again with a non-zero exit, before anything is
+looked up. Sync state is kept per Gitea repository, so two GitHub twins for
+one would share it and read a branch missing on one twin as a deletion; one
+GitHub twin for two Gitea repositories would carry each one's branches, and
+deletions, into the other.
+
 Two columns because a pair can legitimately differ, and one word cannot say so.
 A LAN-only Gitea repository that is public *there* is one a build pod clones
 with no deploy key to provision and one fewer secret in a vault, while the
@@ -301,7 +312,7 @@ tests/run-all.sh            # every tests/test-*.sh; non-zero exit if any fails
 tests/test-local.sh         # the 19-scenario end-to-end run, each step asserted
 ```
 
-**125 checks across 11 files:**
+**200 checks across 12 files** (the number of `ok` lines each prints):
 
 | File | Checks | What it covers |
 | --- | ---: | --- |
@@ -313,9 +324,9 @@ tests/test-local.sh         # the 19-scenario end-to-end run, each step asserted
 | `test-alerts.sh` | 6 | an alert raised while *planning* is not sent for a repo the guard then skips, and is sent once the run goes ahead |
 | `test-lfs.sh` | 4 | a repo using LFS on any branch is skipped unless `ALLOW_LFS=1` — a refs-only sync would leave the twin with dangling pointers |
 | `test-protected-merge.sh` | 4 | a clean divergence on a protected branch alerts, and merges only with `AUTO_MERGE_PROTECTED=1` |
-| `test-github-side.sh` | 9 | a protected branch moving on a private GitHub side alerts once and is still carried; Gitea-side changes, unprotected branches and public GitHub sides stay quiet |
+| `test-github-side.sh` | 8 | a protected branch moving on a private GitHub side alerts once and is still carried; Gitea-side changes, unprotected branches and public GitHub sides stay quiet |
 | `test-github-app.sh` | 14 | signing in as a GitHub App: a JWT that verifies with the app's public key, the installation token asked for with it and left nowhere in `TMP`, git as `x-access-token`, and no attempt to create a repository an app cannot |
-| `test-twins.sh` | 25 | the API half of a run, against a stubbed `curl`: a side declared private that is public or unreadable is never pushed to (and alerted once), `--no-create`, a twin created public by policy refused, `check` failing on a mismatch, the protected-branch alert following what GitHub *is*, and trailing comments in the list |
+| `test-twins.sh` | 76 | the API half of a run, against a stubbed `curl`: a side declared private that is public or unreadable is never pushed to (and alerted once), a lookup answered `500` or not at all stops the pair before anything is fetched, `--no-create`, a twin created public by policy refused on either side, `check` failing on a mismatch on either side, the protected-branch alert following what GitHub *is*, trailing comments in the list, a broken list line failing `run`/`check`/`repos`, and a repository listed in two pairs refused |
 | `test-visibility.sh` | 27 | the declared visibility against what each side is, both columns, and that an unreadable `private` field reads as "unknown" rather than as "public" |
 
 Every scenario is followed by the checks it must pass, and the script exits

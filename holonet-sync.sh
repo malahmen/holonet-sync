@@ -889,7 +889,9 @@ sync_repo() {
 # =============================================================================
 
 # for_each_repo <callback>
-# Reads the repo list on fd 3 so nothing inside the loop can consume it.
+# Reads the whole repo list before the first callback runs, so nothing a
+# callback does can consume it, and so a repository named on two lines is
+# known before either line is acted on.
 # Always returns 0 and leaves the combined callback status in EACH_RC: callers
 # must invoke it bare (never `for_each_repo … || …`), or bash would disable
 # errexit for every callback, including run_one's per-repo subshell.
@@ -906,27 +908,65 @@ sync_repo() {
 # rather than one, because a single word cannot describe an asymmetric pair,
 # and `check` can now compare each side against what it is supposed to be
 # instead of the column being read once, at creation, and never again.
+#
+# A line that cannot be used fails the command (Kamino 195): a malformed line
+# or a misspelled visibility (`Private`) used to be warned about and skipped
+# while run and check exited 0, so the pair silently stopped syncing and
+# nothing watching the exit status could tell. The other lines still run.
+#
+# A repository may belong to ONE pair. The workspace, base refs and status
+# are keyed on the Gitea repository, so two lines giving it different GitHub
+# twins shared base refs, and a branch missing on the second twin planned as
+# "deleted on GitHub" - deleted on Gitea. One GitHub twin for two Gitea
+# repositories would carry each one's branches, and deletions, into the
+# other. Every line naming a shared repository (either side, compared
+# case-insensitively, as both forges do) is refused rather than one of them
+# being picked: which line is the intended one is for a person to say.
+# Keying the state on the pair instead was not chosen: it would keep the
+# two-twins case from corrupting state, but not the one-twin case, and would
+# rename every existing workspace for a configuration that is a mistake.
 for_each_repo() {
-    local cb="$1" line gt_full gh_full vis gt_vis rest matched=0 rc=0 cb_rc
+    local cb="$1" line gt_full gh_full vis gt_vis rest entry n matched=0 rc=0 cb_rc
+    local -a entries=()
+    local -A n_gt=() n_gh=()
     [[ -r "$REPOS_FILE" ]] || error_exit "repo list not found: ${REPOS_FILE}"
 
-    while IFS= read -r line <&3 || [[ -n "$line" ]]; do
+    while IFS= read -r line || [[ -n "$line" ]]; do
         # A trailing comment is dropped before the columns are split: with the
         # fourth column, `a/b a/b private  # offsite` read '#' as the Gitea
         # visibility and the pair stopped syncing (Kamino item 130). A '#' can
         # never be part of an owner/name.
         line="${line%%#*}"
+        gt_full="" gh_full="" vis="" gt_vis=""
         read -r gt_full gh_full vis gt_vis rest <<< "$line"
-        if [[ -z "${gt_full:-}" ]]; then continue; fi
-        if [[ "$gt_full" != */* || "${gh_full:-}" != */* ]]; then warn "skipping malformed line: ${gt_full} ${gh_full:-}"; continue; fi
+        if [[ -z "$gt_full" ]]; then continue; fi
+        if [[ "$gt_full" != */* || "$gh_full" != */* ]]; then error "skipping malformed line: ${gt_full} ${gh_full}"; rc=1; continue; fi
         vis="${vis:-$DEFAULT_VISIBILITY}"
-        if [[ "$vis" != private && "$vis" != public ]]; then warn "bad visibility '${vis}' for ${gt_full}; skipping"; continue; fi
+        if [[ "$vis" != private && "$vis" != public ]]; then error "bad visibility '${vis}' for ${gt_full}; skipping"; rc=1; continue; fi
         # Defaults to the GitHub side, so every list written before the fourth
         # column existed behaves exactly as it did.
         gt_vis="${gt_vis:-$vis}"
-        if [[ "$gt_vis" != private && "$gt_vis" != public ]]; then warn "bad gitea visibility '${gt_vis}' for ${gt_full}; skipping"; continue; fi
+        if [[ "$gt_vis" != private && "$gt_vis" != public ]]; then error "bad gitea visibility '${gt_vis}' for ${gt_full}; skipping"; rc=1; continue; fi
+        entries+=("${gt_full} ${gh_full} ${vis} ${gt_vis}")
+        n="${n_gt[${gt_full,,}]:-0}"; n_gt[${gt_full,,}]=$((n + 1))
+        n="${n_gh[${gh_full,,}]:-0}"; n_gh[${gh_full,,}]=$((n + 1))
+    done < "$REPOS_FILE"
+
+    # An empty array under `set -u` is an error on bash < 4.4.
+    for entry in ${entries[@]+"${entries[@]}"}; do
+        read -r gt_full gh_full vis gt_vis <<< "$entry"
         if [[ -n "$ONLY_REPO" && "$gt_full" != "$ONLY_REPO" ]]; then continue; fi
         matched=$((matched + 1))
+        n="${n_gt[${gt_full,,}]}"
+        if (( n > 1 )); then
+            error "gitea:${gt_full} is listed more than once (${n} lines): refusing every line for it, since the pairs would share sync state; keep one line per repository"
+            rc=1; continue
+        fi
+        n="${n_gh[${gh_full,,}]}"
+        if (( n > 1 )); then
+            error "github:${gh_full} is the twin of more than one Gitea repository (${n} lines): refusing every line for it, since each would carry its branches and deletions into the other; keep one line per repository"
+            rc=1; continue
+        fi
         # Not `"$cb" … || rc=1`: bash ignores errexit for everything run from
         # an ||/&&/if context, including the `( set -e; … )` subshell in
         # run_one, so the callback must be called bare and its status read
@@ -936,7 +976,7 @@ for_each_repo() {
         cb_rc=$?
         set -e
         (( cb_rc == 0 )) || rc=1
-    done 3< "$REPOS_FILE"
+    done
 
     if [[ -n "$ONLY_REPO" ]] && (( matched == 0 )); then error_exit "${ONLY_REPO} is not in ${REPOS_FILE}"; fi
     EACH_RC=$rc
