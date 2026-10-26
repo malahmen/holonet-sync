@@ -7,7 +7,8 @@
 #
 # No network: git remotes are file://, and `curl` is a stub on PATH that
 # answers from $T/api/<gt|gh>/<owner>/<name> (the repository's `private`
-# field; no file is a 404) and creates the bare repository on a POST.
+# field; no file is a 404; `http:<code>` answers that code, 000 being no
+# answer at all) and creates the bare repository on a POST.
 #
 # Usage: tests/test-twins.sh
 set -uo pipefail
@@ -52,7 +53,12 @@ case "$method $path" in
         f="$T/api/$side/${path#/repos/}"
         if [[ -f "$f" ]]; then
             p="$(cat "$f")"
-            if [[ "$p" == none ]]; then echo '{"default_branch":"main"}' > "$out"
+            # http:<code> — the API failing: 000 is curl getting no answer at
+            # all (it prints 000 and exits non-zero), anything else a server
+            # error with a body.
+            if [[ "$p" == http:000 ]]; then echo "curl: (28) Operation timed out" >&2; printf 000; exit 28
+            elif [[ "$p" == http:* ]]; then echo '{"message":"stub: server error"}' > "$out"; printf '%s' "${p#http:}"
+            elif [[ "$p" == none ]]; then echo '{"default_branch":"main"}' > "$out"
             else printf '{"private":%s,"default_branch":"main"}\n' "$p" > "$out"; fi
             printf 200
         else echo '{"message":"Not Found"}' > "$out"; printf 404; fi ;;
@@ -107,6 +113,13 @@ pair gtleak  false true    # declared private on BOTH sides; Gitea is public
 pair pubdecl false true    # declared public; GitHub is private (nothing leaks)
 pair create  false ""      # GitHub side missing
 pair policy  false ""      # GitHub side missing; created public by policy
+pair gt500   http:500 true # Gitea answers 500; GitHub private as declared
+pair gt000   http:000 true # Gitea does not answer at all
+pair gh500   false http:500
+pair gh000   false http:000
+pair gtpolicy "" true      # Gitea side missing; created public by policy
+c="$T/seed-gh-gtpolicy"; git clone -q "$T/gh/me/gtpolicy.git" "$c" 2>/dev/null
+echo gtpolicy > "$c/f"; git -C "$c" add f; git -C "$c" commit -qm gtpolicy; git -C "$c" push -q origin main
 cat > "$LIST" <<L
 # a full-line comment
 me/leak     me/leak     private public
@@ -116,6 +129,11 @@ me/gtleak   me/gtleak   private private
 me/pubdecl  me/pubdecl  public   # three columns, then a comment
 me/create   me/create   private public
 me/policy   me/policy   private public
+me/gt500    me/gt500    private
+me/gt000    me/gt000    private
+me/gh500    me/gh500    private public
+me/gh000    me/gh000    private public
+me/gtpolicy me/gtpolicy private
 L
 
 echo "== 129: nothing private is pushed somewhere public =="
@@ -138,6 +156,22 @@ GS run --repo me/pubdecl
 check "declared public, actually private: still syncs" synced pubdecl
 
 echo
+echo "== 172: an API that does not answer stops the pair before anything moves =="
+# Without a 200 there is no visibility to gate on. Falling through would fetch
+# and push with no visibility read at all; the pair must fail closed instead.
+ws() { test -e "$T/state/repos/me+$1.git"; }
+status_is() { "$SYNC" status --config "$T/cfg/holonet-sync.conf" 2>/dev/null | grep -E "[[:space:]]me/$1[[:space:]]" | grep -q "$2"; }
+for r in gt500 gt000 gh500 gh000; do
+    GS run --repo "me/$r"
+    check "$r: run fails"                              test "$RC" -ne 0
+    check "  saying the lookup failed"                 said "API lookup failed"
+    check "  nothing fetched (no workspace)"           not ws "$r"
+    check "  nothing pushed to GitHub"                 test "$(tip gh "$r")" = -
+    check "  nothing created"                          not grep -q "POST" "$T/api.log"
+    check "  recorded as ERROR in status"              status_is "$r" ERROR
+done
+
+echo
 echo "== creation, and --no-create =="
 GS run --repo me/create --no-create
 check "--no-create: a missing twin fails the run"      test "$RC" -ne 0
@@ -151,6 +185,13 @@ GS run --repo me/policy
 rm -f "$T/policy"
 check "a twin created public despite the request: refused" said "github:me/policy is public but the list declares it private"
 check "  nothing pushed into it"                       test "$(tip gh policy)" = -
+echo false > "$T/policy"
+GS run --repo me/gtpolicy
+rm -f "$T/policy"
+check "a Gitea twin created public despite the request: refused" said "gitea:me/gtpolicy is public but the list declares it private"
+check "  the run fails"                                test "$RC" -ne 0
+check "  nothing pushed into it"                       test "$(tip gt gtpolicy)" = -
+check "  recorded as ERROR in status"                  status_is gtpolicy ERROR
 
 echo
 echo "== check fails on a mismatch =="
@@ -159,6 +200,9 @@ check "check passes when every side is as declared"   test "$RC" -eq 0
 GS check --repo me/pubdecl
 check "check exits non-zero on a mismatch"            test "$RC" -ne 0
 check "  naming it"                                   said "github:me/pubdecl is private but the list declares public"
+GS check --repo me/gtleak
+check "check exits non-zero on a Gitea mismatch"      test "$RC" -ne 0
+check "  naming it"                                   said "gitea:me/gtleak is public but the list declares private"
 
 echo
 echo "== 130: the protected-branch alert follows what GitHub is =="
