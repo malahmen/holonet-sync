@@ -217,7 +217,7 @@ echo
 echo "== 130: trailing comments =="
 check "a trailing comment does not become the visibility" not grep -q "bad gitea visibility" "$T/last.out"
 GS repos
-check "repos lists the commented pair with its columns"    bash -c 'grep -qP "^me/pubdecl\tme/pubdecl\tpublic\tpublic$" "$1"' _ "$T/last.out"
+check "repos lists the commented pair with its columns"    grep -qx "me/pubdecl$(printf '\t')me/pubdecl$(printf '\t')public$(printf '\t')public" "$T/last.out"
 check "a full-line comment is still skipped"               not said "a full-line"
 
 echo
